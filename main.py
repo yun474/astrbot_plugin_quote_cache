@@ -85,9 +85,20 @@ class QuoteCachePlugin(Star):
         self._store_ttl_seconds = ttl_hours * 3600
         self._store_max_entries = max_entries
         self.store = self._new_store()
+        configured_attachment_mode = str(
+            self.config.get("attachment_cache_mode", "") or ""
+        ).strip().lower()
+        if configured_attachment_mode not in {"eager", "lazy"}:
+            # Backward compatibility for v0.2.x configuration files.
+            configured_attachment_mode = (
+                "eager"
+                if _config_bool(self.config, "persist_attachments", True)
+                else "lazy"
+            )
+        self.attachment_cache_mode = configured_attachment_mode
         self.media = MediaCache(
             self.data_dir / "media",
-            enabled=_config_bool(self.config, "persist_attachments", True),
+            enabled=True,
             max_bytes=_config_int(self.config, "max_attachment_mb", 50, 1)
             * 1024
             * 1024,
@@ -133,12 +144,13 @@ class QuoteCachePlugin(Star):
         removed, paths = self.store.cleanup_expired()
         media_removed = self.media.remove_paths(paths)
         logger.info(
-            "[quote-cache] ready: db=%s, ttl=%sh, expired=%s, media_removed=%s, raw_bridge=%s",
+            "[quote-cache] ready: db=%s, ttl=%sh, expired=%s, media_removed=%s, raw_bridge=%s, attachment_mode=%s",
             self.store.db_path,
             self.store.ttl_seconds // 3600,
             removed,
             media_removed,
             bridge_installed,
+            self.attachment_cache_mode,
         )
         if self.auto_cleanup_enabled and (
             self._cleanup_task is None or self._cleanup_task.done()
@@ -211,8 +223,35 @@ class QuoteCachePlugin(Star):
         except Exception:
             return str(value(event.message_obj, "self_id", "") or "")
 
-    async def _persist_attachments(self, attachments: list[dict]) -> list[dict]:
+    async def _materialize_attachments(self, attachments: list[dict]) -> list[dict]:
         return await self.media.persist_all(attachments)
+
+    async def _attachments_for_initial_cache(
+        self, attachments: list[dict]
+    ) -> list[dict]:
+        if self.attachment_cache_mode == "eager":
+            return await self._materialize_attachments(attachments)
+        return attachments
+
+    @staticmethod
+    def _prefer_fresh_attachment_metadata(
+        cached: list[dict], fresh: list[dict]
+    ) -> list[dict]:
+        """Use quote-event URLs while retaining already materialized local files."""
+        if not fresh:
+            return [dict(item) for item in cached]
+        merged: list[dict] = []
+        for index, fresh_item in enumerate(fresh):
+            item = dict(fresh_item)
+            if index < len(cached):
+                old = cached[index]
+                old_path = str(old.get("local_path") or "")
+                if old_path and Path(old_path).is_file():
+                    item["local_path"] = old_path
+                    if old.get("cached_size"):
+                        item["cached_size"] = old["cached_size"]
+            merged.append(item)
+        return merged
 
     async def _cache_inbound(self, event: AstrMessageEvent) -> None:
         message_obj = event.message_obj
@@ -224,7 +263,7 @@ class QuoteCachePlugin(Star):
         )
         if not attachments:
             attachments = raw_attachments(source)
-        attachments = await self._persist_attachments(attachments)
+        attachments = await self._attachments_for_initial_cache(attachments)
         aliases = current_aliases(event)
         alias_map = dict(aliases)
         astr_id = str(value(message_obj, "message_id", "") or "")
@@ -347,7 +386,7 @@ class QuoteCachePlugin(Star):
             async def wrapped_post_send_one(message_to_send, *args, **kwargs):
                 chain = list(value(message_to_send, "chain", []) or [])
                 components, attachments, outline = serialize_chain(chain)
-                attachments = await self._persist_attachments(attachments)
+                attachments = await self._attachments_for_initial_cache(attachments)
                 response = await original_one(message_to_send, *args, **kwargs)
                 await self._cache_outgoing_response(
                     event, response, components, attachments, outline
@@ -367,7 +406,7 @@ class QuoteCachePlugin(Star):
             send_buffer = getattr(event, "send_buffer", None)
             chain = list(value(send_buffer, "chain", []) or [])
             components, attachments, outline = serialize_chain(chain)
-            attachments = await self._persist_attachments(attachments)
+            attachments = await self._attachments_for_initial_cache(attachments)
             response = await original(*args, **kwargs)
             await self._cache_outgoing_response(
                 event, response, components, attachments, outline
@@ -429,7 +468,11 @@ class QuoteCachePlugin(Star):
     async def _entry_from_embedded(
         self, event: AstrMessageEvent, data: dict
     ) -> CachedMessage:
-        attachments = await self._persist_attachments(list(data.get("attachments") or []))
+        # Embedded quote data is already on the demand path, so both modes may
+        # materialize it here for multimodal LLM input.
+        attachments = await self._materialize_attachments(
+            list(data.get("attachments") or [])
+        )
         now = int(time.time())
         return CachedMessage(
             scope_key=self._scope_key(event),
@@ -564,6 +607,21 @@ class QuoteCachePlugin(Star):
             event.set_extra("quote_cache_result", {"hit": False, "reference_ids": refs})
             logger.info("[quote-cache] quote miss: scope=%s refs=%s", scope, refs)
             return
+        fresh_attachments = (
+            list(fallback.get("attachments") or []) if fallback else []
+        )
+        if self.attachment_cache_mode == "lazy" and (
+            entry.attachments or fresh_attachments
+        ):
+            candidates = self._prefer_fresh_attachment_metadata(
+                entry.attachments, fresh_attachments
+            )
+            entry.attachments = await self._materialize_attachments(candidates)
+            aliases = [(ref, "lazy_quote_lookup") for ref in refs]
+            if entry.ref_index:
+                aliases.append((entry.ref_index, "ref_index"))
+            self.store.put(entry, aliases)
+            source = f"{source}+lazy_media"
         self._inject_text(req, self._format_entry(entry, refs))
         self._inject_media(req, entry)
         event.set_extra(
@@ -625,6 +683,7 @@ class QuoteCachePlugin(Star):
             f"当前会话：{scope_stats['messages']} 条\n"
             f"全库：{all_stats['messages']} 条 / {all_stats['aliases']} 个索引\n"
             f"TTL：{all_stats['ttl_seconds'] // 3600} 小时\n"
+            f"附件缓存模式：{self.attachment_cache_mode}\n"
             f"数据库：{all_stats['db_path']}\n"
             f"媒体目录：{self.media.root}"
         )

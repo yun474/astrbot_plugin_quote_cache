@@ -36,6 +36,13 @@ class MediaCache:
         return list(await asyncio.gather(*(self.persist(dict(x)) for x in attachments)))
 
     async def persist(self, attachment: dict) -> dict:
+        cached_path = str(attachment.get("local_path") or "")
+        if cached_path:
+            try:
+                if Path(cached_path).is_file():
+                    return attachment
+            except OSError:
+                pass
         source = str(attachment.get("source") or attachment.get("path") or attachment.get("url") or attachment.get("file") or "")
         if not source:
             return attachment

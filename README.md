@@ -4,7 +4,7 @@
 
 ## 能做什么
 
-- 缓存收到的文本、图片、语音、视频、文件及常见消息段结构。
+- 缓存收到的文本、图片、语音、视频、文件元数据及常见消息段结构。
 - 一条消息可同时使用 AstrBot 消息 ID、QQ 原始 ID、REFIDX 等多个索引查询。
 - 优先解析 AstrBot `Reply.id`，并兼容 `message_scene.ext`、`message_type == 103` 与 `msg_elements[0]`。
 - 直接识别 botpy 保留下来的 `message_reference.message_id`。
@@ -25,6 +25,19 @@ https://github.com/yun474/astrbot_plugin_quote_cache
 ```
 
 默认只处理 `qq_official` 和 `qq_official_webhook`。如果你的平台实例 ID 或适配器名称不同，在插件配置的 `platform_allowlist` 中追加实际名称；留空则处理所有平台。
+
+## 附件缓存模式
+
+配置项 `attachment_cache_mode` 提供两种模式：
+
+| 模式 | 收到普通消息时 | 消息被引用时 | 特点 |
+|---|---|---|---|
+| `lazy`（默认） | 只保存消息 ID、REFIDX、附件 URL 与元数据 | 优先用本次引用 payload 的新 URL 下载；没有新 URL 时回退历史 URL | 大幅减少服务器带宽和磁盘占用，但历史 URL 过期且引用事件不带附件时可能无法恢复媒体 |
+| `eager` | 立即下载图片、语音、视频和文件 | 直接读取本地缓存 | 引用最稳定，但群内所有媒体都会产生一次服务器下行流量并占用磁盘 |
+
+QQ 官方的 Group/C2C SDK 当前没有提供一个通用的“按历史消息 ID 重新获取完整消息附件”方法。因此 `lazy` 并不是只凭 ID 向 API 回查，而是优先使用引用事件 `message_type=103/msg_elements[0]` 中平台重新下发的附件 URL；只有该字段缺失时才尝试消息库保存的旧 URL。
+
+旧版 `persist_attachments=true/false` 仍做兼容：配置文件还没有 `attachment_cache_mode` 时，会分别按 `eager/lazy` 解释。
 
 ## 自动清理配置
 
@@ -86,7 +99,7 @@ data/plugin_data/astrbot_plugin_quote_cache/
 
 ## 附件安全与限制
 
-- 本地附件会复制到插件媒体目录，避免 AstrBot 清理临时文件后引用失效。
+- `eager` 模式会在入站时复制或下载附件；`lazy` 模式只在引用命中时落地媒体。
 - HTTP(S) 附件下载前会解析 DNS，并拒绝回环、内网、链路本地、保留地址和带用户名密码的 URL；重定向目标也会重新检查。
 - 单个附件默认最大 50 MB，下载超时默认 20 秒，均可在配置中调整。
 - 文件/视频是否能被模型直接理解取决于 LLM 提供商。本插件保证缓存并注入元数据；常见纯文本文件会额外注入预览。

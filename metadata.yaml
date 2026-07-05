@@ -2,7 +2,7 @@ name: astrbot_plugin_quote_cache
 display_name: QQ引用消息缓存
 desc: 为 QQ 官方机器人维护消息 ID/REFIDX 本地缓存，并将被引用的文本、图片、语音、视频和文件注入 LLM 上下文。
 help: 回复消息后正常 @机器人；管理员可用 /引用缓存状态、/引用缓存调试、/引用缓存清理。
-version: v0.2.1
+version: v0.3.0
 author: Codex
 repo: "https://github.com/yun474/astrbot_plugin_quote_cache"
 astrbot_version: ">=3.4.21"

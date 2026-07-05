@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0
+
+- 新增 `attachment_cache_mode`，支持 `lazy`（引用时下载）和 `eager`（收到时下载）。
+- 新安装默认使用 `lazy`，普通消息只保存消息 ID、REFIDX、附件 URL 与元数据。
+- 懒加载优先采用当前引用事件 `msg_elements[0]` 中的新附件地址，失败时回退历史 URL。
+- 已经成功懒加载的媒体会复用本地文件，不会在每次引用时重复下载。
+- 兼容旧版 `persist_attachments` 配置：未出现新配置项时，`true/false` 分别映射为 `eager/lazy`。
+
 ## v0.2.1
 
 - 修复插件停用后 SQLite 已关闭、同一实例再次启用时无法初始化的问题。

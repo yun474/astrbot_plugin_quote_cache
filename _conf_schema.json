@@ -33,11 +33,12 @@
     "type": "int",
     "default": 50000
   },
-  "persist_attachments": {
-    "description": "将引用所需附件保存到本地媒体缓存",
-    "type": "bool",
-    "default": true,
-    "hint": "远程地址仅在 DNS 与目标地址均为公网时下载，避免访问内网地址。"
+  "attachment_cache_mode": {
+    "description": "附件缓存模式",
+    "type": "string",
+    "default": "lazy",
+    "options": ["lazy", "eager"],
+    "hint": "lazy：收到消息时只存 ID、URL 和元数据，被引用时才下载；eager：收到图片、语音、视频或文件时立即下载，引用更稳但更耗带宽和磁盘。"
   },
   "max_attachment_mb": {
     "description": "单个缓存附件最大大小（MB）",
