@@ -1,0 +1,90 @@
+{
+  "enabled": {
+    "description": "启用引用消息缓存与上下文注入",
+    "type": "bool",
+    "default": true
+  },
+  "platform_allowlist": {
+    "description": "启用的平台适配器名称",
+    "type": "string",
+    "default": "qq_official,qq_official_webhook",
+    "hint": "逗号或换行分隔；留空表示所有平台。平台实例 ID 不同的话也可直接填实例 ID。"
+  },
+  "ttl_hours": {
+    "description": "缓存保留时间（小时）",
+    "type": "int",
+    "default": 48,
+    "hint": "默认两天。超过此时间的消息和附件会在下一次清理时删除。"
+  },
+  "auto_cleanup_enabled": {
+    "description": "启用周期性自动清理",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仍可使用 /引用缓存清理 手动删除过期缓存。插件启动时始终会清理一次已过期数据。"
+  },
+  "cleanup_interval_minutes": {
+    "description": "自动清理扫描周期（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "仅在启用周期性自动清理时生效，最小 5 分钟。"
+  },
+  "max_entries": {
+    "description": "缓存消息数量上限",
+    "type": "int",
+    "default": 50000
+  },
+  "persist_attachments": {
+    "description": "将引用所需附件保存到本地媒体缓存",
+    "type": "bool",
+    "default": true,
+    "hint": "远程地址仅在 DNS 与目标地址均为公网时下载，避免访问内网地址。"
+  },
+  "max_attachment_mb": {
+    "description": "单个缓存附件最大大小（MB）",
+    "type": "int",
+    "default": 50
+  },
+  "download_timeout_seconds": {
+    "description": "远程附件下载超时（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "capture_outgoing_ids": {
+    "description": "尝试捕获 QQ 官方发送回包并缓存机器人回复",
+    "type": "bool",
+    "default": true,
+    "hint": "使用 QQ 官方事件的内部发送函数做兼容包装；若对应 AstrBot 版本没有该函数会自动跳过。"
+  },
+  "inject_images": {
+    "description": "将被引用消息中的图片加入 LLM 图片输入",
+    "type": "bool",
+    "default": true
+  },
+  "inject_audio": {
+    "description": "将被引用消息中的语音加入 LLM 音频输入",
+    "type": "bool",
+    "default": true
+  },
+  "max_injected_text_length": {
+    "description": "单次引用注入的最大字符数",
+    "type": "int",
+    "default": 12000
+  },
+  "file_preview_chars": {
+    "description": "文本类文件注入的最大预览字符数",
+    "type": "int",
+    "default": 8000,
+    "hint": "设置为 0 可关闭文件内容预览。"
+  },
+  "admin_user_ids": {
+    "description": "额外允许使用缓存管理指令的用户 ID",
+    "type": "string",
+    "default": "",
+    "hint": "逗号或换行分隔；AstrBot 自身管理员无需填写。"
+  },
+  "debug_log": {
+    "description": "输出详细缓存调试日志",
+    "type": "bool",
+    "default": false
+  }
+}
