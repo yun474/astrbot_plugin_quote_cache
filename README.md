@@ -102,3 +102,5 @@ data/plugin_data/astrbot_plugin_quote_cache/
 如果调试结果里既没有 `Reply.id`，也没有 `message_scene/msg_elements/ref_msg_idx`，那就是适配器进入插件层前已丢弃引用关系。普通 Star 插件无法凭空恢复目标 ID，此时只能升级/修补 QQ 官方适配器，或改用保留完整 payload 的平台适配器插件。
 
 从 v0.2.0 起，插件默认开启 `capture_raw_payload_bridge`，会在 botpy 消息对象构造入口保存一份短期 payload 旁路，因此正常情况下调试信息会显示“捕获原始 payload：是”。升级后必须重载插件或重启 AstrBot，旧进程中的 v0.1.x 不会自动获得这个构造器包装。
+
+v0.2.1 起支持在 AstrBot 面板中反复停用、启用插件：SQLite 连接、后台清理任务和 botpy payload 旁路都会随生命周期安全关闭并重新创建。

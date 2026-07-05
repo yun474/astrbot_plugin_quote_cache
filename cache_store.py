@@ -42,6 +42,7 @@ class MessageStore:
         self.ttl_seconds = max(int(ttl_seconds), 60)
         self.max_entries = max(int(max_entries), 100)
         self._lock = threading.RLock()
+        self._closed = False
         self._db = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         with self._lock:
@@ -314,4 +315,11 @@ class MessageStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._db.close()
+            self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed

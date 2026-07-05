@@ -81,11 +81,10 @@ class QuoteCachePlugin(Star):
             Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
         ).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.store = MessageStore(
-            self.data_dir / "messages.sqlite3",
-            ttl_seconds=ttl_hours * 3600,
-            max_entries=max_entries,
-        )
+        self._store_path = self.data_dir / "messages.sqlite3"
+        self._store_ttl_seconds = ttl_hours * 3600
+        self._store_max_entries = max_entries
+        self.store = self._new_store()
         self.media = MediaCache(
             self.data_dir / "media",
             enabled=_config_bool(self.config, "persist_attachments", True),
@@ -120,7 +119,16 @@ class QuoteCachePlugin(Star):
         self._store_lock = asyncio.Lock()
         self.raw_bridge = RawPayloadBridge()
 
+    def _new_store(self) -> MessageStore:
+        return MessageStore(
+            self._store_path,
+            ttl_seconds=self._store_ttl_seconds,
+            max_entries=self._store_max_entries,
+        )
+
     async def initialize(self) -> None:
+        if self.store.closed:
+            self.store = self._new_store()
         bridge_installed = self.raw_bridge.install() if self.capture_raw_payload else False
         removed, paths = self.store.cleanup_expired()
         media_removed = self.media.remove_paths(paths)
@@ -132,7 +140,9 @@ class QuoteCachePlugin(Star):
             media_removed,
             bridge_installed,
         )
-        if self.auto_cleanup_enabled:
+        if self.auto_cleanup_enabled and (
+            self._cleanup_task is None or self._cleanup_task.done()
+        ):
             self._cleanup_task = asyncio.create_task(
                 self._cleanup_loop(), name="astrbot-quote-cache-cleanup"
             )
@@ -144,9 +154,13 @@ class QuoteCachePlugin(Star):
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
-        await self.media.close()
-        self.raw_bridge.restore()
-        self.store.close()
+            finally:
+                self._cleanup_task = None
+        try:
+            await self.media.close()
+        finally:
+            self.raw_bridge.restore()
+            self.store.close()
 
     async def _cleanup_loop(self) -> None:
         while True:

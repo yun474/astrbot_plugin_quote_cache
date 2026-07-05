@@ -28,6 +28,8 @@ class RawPayloadBridge:
         self._token = object()
 
     def install(self) -> bool:
+        if self._patched:
+            return True
         try:
             import botpy.message as botpy_message
         except ImportError:

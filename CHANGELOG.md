@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1
+
+- 修复插件停用后 SQLite 已关闭、同一实例再次启用时无法初始化的问题。
+- 初始化时自动重建已关闭的消息库，清理任务与 botpy payload 旁路支持重复启停。
+- `terminate()`、SQLite `close()` 和 payload bridge `install()` 改为幂等操作。
+
 ## v0.2.0
 
 - 修复未解析 botpy `message_reference.message_id`，导致普通引用无法命中缓存的问题。

@@ -54,6 +54,14 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             store.close()
 
+    def test_close_is_idempotent_and_exposes_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MessageStore(Path(tmp) / "cache.db", ttl_seconds=3600)
+            self.assertFalse(store.closed)
+            store.close()
+            self.assertTrue(store.closed)
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
