@@ -39,9 +39,9 @@ class Obj:
 
 
 class Event:
-    def __init__(self, raw, chain):
+    def __init__(self, raw, chain, extra=None):
         self.message_obj = Obj("ASTR-1", raw, chain)
-        self._extra = {}
+        self._extra = extra or {}
 
     def get_extra(self, key=None, default=None):
         return self._extra if key is None else self._extra.get(key, default)
@@ -87,6 +87,28 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(data["content"], "quoted text")
         self.assertEqual(data["ref_index"], "REFIDX-x")
         self.assertEqual(data["attachments"][0]["type"], "image")
+
+    def test_botpy_message_reference(self):
+        class MessageReference:
+            message_id = "QQ-HISTORY"
+
+        class BotpyMessage:
+            id = "QQ-CURRENT"
+            message_reference = MessageReference()
+
+        event = Event(BotpyMessage(), [])
+        self.assertEqual(reference_aliases(event), ["QQ-HISTORY"])
+
+    def test_captured_payload_is_preferred_for_refidx(self):
+        captured = {
+            "id": "QQ-CURRENT",
+            "message_type": 103,
+            "message_scene": {"ext": ["ref_msg_idx=REFIDX-old", "msg_idx=REFIDX-new"]},
+            "msg_elements": [{"msg_idx": "REFIDX-old", "content": "quoted"}],
+        }
+        event = Event(object(), [], {"quote_cache_raw_payload": captured})
+        self.assertIn("REFIDX-old", reference_aliases(event))
+        self.assertEqual(embedded_quote(event)["content"], "quoted")
 
     def test_chain_supports_text_and_media(self):
         components, attachments, outline = serialize_chain(

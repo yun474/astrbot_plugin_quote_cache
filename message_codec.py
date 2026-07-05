@@ -85,17 +85,38 @@ def _reply_components(event: Any) -> list[Any]:
     return [comp for comp in chain if comp.__class__.__name__.lower() in {"reply", "quote"}]
 
 
-def current_aliases(event: Any) -> list[tuple[str, str]]:
+def event_sources(event: Any) -> list[tuple[Any, str]]:
     message_obj = value(event, "message_obj")
     raw = value(message_obj, "raw_message")
     extras = event.get_extra() if callable(getattr(event, "get_extra", None)) else {}
+    captured = value(extras, "quote_cache_raw_payload")
+    result: list[tuple[Any, str]] = []
+    seen: set[int] = set()
+    for source, name in (
+        (captured, "captured_payload"),
+        (raw, "raw"),
+        (extras, "event_extra"),
+    ):
+        if source is None or id(source) in seen:
+            continue
+        seen.add(id(source))
+        result.append((source, name))
+    return result
+
+
+def current_aliases(event: Any) -> list[tuple[str, str]]:
+    message_obj = value(event, "message_obj")
     pairs: list[tuple[Any, str]] = [
         (value(message_obj, "message_id"), "astr_message_id"),
-        (value(raw, "id"), "raw_id"),
-        (value(raw, "message_id"), "raw_message_id"),
-        (value(raw, "msg_id"), "raw_msg_id"),
     ]
-    for owner, prefix in ((raw, "raw"), (extras, "event_extra")):
+    for owner, prefix in event_sources(event):
+        pairs.extend(
+            (
+                (value(owner, "id"), f"{prefix}_id"),
+                (value(owner, "message_id"), f"{prefix}_message_id"),
+                (value(owner, "msg_id"), f"{prefix}_msg_id"),
+            )
+        )
         _, msg_idx = scene_indices(owner)
         pairs.append((msg_idx, f"{prefix}_msg_idx"))
         for key in ("msg_idx", "ref_idx"):
@@ -105,14 +126,22 @@ def current_aliases(event: Any) -> list[tuple[str, str]]:
 
 def reference_aliases(event: Any) -> list[str]:
     message_obj = value(event, "message_obj")
-    raw = value(message_obj, "raw_message")
-    extras = event.get_extra() if callable(getattr(event, "get_extra", None)) else {}
     pairs: list[tuple[Any, str]] = []
     for comp in _reply_components(event):
         pairs.append((value(comp, "id"), "reply_component"))
-    for owner, prefix in ((raw, "raw"), (extras, "event_extra")):
+    for owner, prefix in event_sources(event):
         ref_idx, _ = scene_indices(owner)
         pairs.append((ref_idx, f"{prefix}_ref_msg_idx"))
+        message_reference = value(owner, "message_reference")
+        if message_reference:
+            pairs.append(
+                (
+                    value(message_reference, "message_id")
+                    or value(message_reference, "id")
+                    or value(message_reference, "msg_idx"),
+                    f"{prefix}_message_reference",
+                )
+            )
         for key in REFERENCE_ID_KEYS:
             candidate = value(owner, key)
             if isinstance(candidate, dict):
@@ -122,9 +151,12 @@ def reference_aliases(event: Any) -> list[str]:
                     or candidate.get("msg_idx")
                 )
             pairs.append((candidate, f"{prefix}_{key}"))
-    elements = value(raw, "msg_elements") or value(extras, "msg_elements") or []
-    if message_type_number(raw) == 103 and elements:
-        pairs.append((value(elements[0], "msg_idx"), "quote_element_msg_idx"))
+    for owner, prefix in event_sources(event):
+        elements = value(owner, "msg_elements") or []
+        if message_type_number(owner) == 103 and elements:
+            pairs.append(
+                (value(elements[0], "msg_idx"), f"{prefix}_quote_element_msg_idx")
+            )
     return [alias for alias, _ in unique_aliases(pairs)]
 
 
@@ -236,20 +268,16 @@ def raw_attachments(source: Any) -> list[dict[str, Any]]:
 
 def embedded_quote(event: Any) -> dict[str, Any] | None:
     message_obj = value(event, "message_obj")
-    raw = value(message_obj, "raw_message")
-    extras = event.get_extra() if callable(getattr(event, "get_extra", None)) else {}
-    msg_type = message_type_number(raw)
-    if msg_type is None:
-        msg_type = message_type_number(extras)
-    elements = value(raw, "msg_elements") or value(extras, "msg_elements") or []
-    if msg_type == 103 and elements:
-        node = elements[0]
-        return {
-            "content": str(value(node, "content", "") or ""),
-            "attachments": raw_attachments(node),
-            "ref_index": clean_id(value(node, "msg_idx")),
-            "source": "msg_elements[0]",
-        }
+    for owner, source_name in event_sources(event):
+        elements = value(owner, "msg_elements") or []
+        if message_type_number(owner) == 103 and elements:
+            node = elements[0]
+            return {
+                "content": str(value(node, "content", "") or ""),
+                "attachments": raw_attachments(node),
+                "ref_index": clean_id(value(node, "msg_idx")),
+                "source": f"{source_name}.msg_elements[0]",
+            }
     for comp in _reply_components(event):
         chain = value(comp, "chain") or []
         components, attachments, outline = serialize_chain(chain)
@@ -270,18 +298,35 @@ def embedded_quote(event: Any) -> dict[str, Any] | None:
 
 def raw_metadata(event: Any) -> dict[str, Any]:
     message_obj = value(event, "message_obj")
-    raw = value(message_obj, "raw_message")
     extras = event.get_extra() if callable(getattr(event, "get_extra", None)) else {}
-    ref_idx, msg_idx = scene_indices(raw)
-    if not (ref_idx or msg_idx):
-        ref_idx, msg_idx = scene_indices(extras)
+    raw = value(message_obj, "raw_message")
+    captured = value(extras, "quote_cache_raw_payload")
+    ref_idx = msg_idx = ""
+    msg_type = None
+    message_reference_id = ""
+    for owner, _ in event_sources(event):
+        owner_ref, owner_msg = scene_indices(owner)
+        ref_idx = ref_idx or owner_ref
+        msg_idx = msg_idx or owner_msg
+        msg_type = msg_type if msg_type is not None else message_type_number(owner)
+        message_reference = value(owner, "message_reference")
+        message_reference_id = message_reference_id or clean_id(
+            value(message_reference, "message_id")
+            or value(message_reference, "id")
+            or value(message_reference, "msg_idx")
+        )
     raw_keys = sorted(str(k) for k in getattr(raw, "__dict__", {}).keys())[:200]
     if isinstance(raw, dict):
         raw_keys = sorted(str(k) for k in raw.keys())[:200]
     return {
         "raw_type": type(raw).__name__,
         "raw_keys": raw_keys,
-        "message_type": message_type_number(raw),
+        "captured_payload": bool(captured),
+        "captured_keys": sorted(str(k) for k in captured.keys())[:200]
+        if isinstance(captured, dict)
+        else [],
+        "message_type": msg_type,
+        "message_reference_id": message_reference_id,
         "ref_msg_idx": ref_idx,
         "msg_idx": msg_idx,
         "event_extra_keys": sorted(str(k) for k in extras.keys()) if isinstance(extras, dict) else [],

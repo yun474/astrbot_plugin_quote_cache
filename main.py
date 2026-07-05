@@ -8,6 +8,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -30,6 +31,7 @@ from .message_codec import (
     serialize_chain,
     value,
 )
+from .raw_payload_bridge import RawPayloadBridge
 
 
 PLUGIN_NAME = "astrbot_plugin_quote_cache"
@@ -95,6 +97,9 @@ class QuoteCachePlugin(Star):
         self.capture_outgoing = _config_bool(
             self.config, "capture_outgoing_ids", True
         )
+        self.capture_raw_payload = _config_bool(
+            self.config, "capture_raw_payload_bridge", True
+        )
         self.inject_images = _config_bool(self.config, "inject_images", True)
         self.inject_audio = _config_bool(self.config, "inject_audio", True)
         self.max_injected_text = _config_int(
@@ -113,16 +118,19 @@ class QuoteCachePlugin(Star):
         )
         self._cleanup_task: asyncio.Task | None = None
         self._store_lock = asyncio.Lock()
+        self.raw_bridge = RawPayloadBridge()
 
     async def initialize(self) -> None:
+        bridge_installed = self.raw_bridge.install() if self.capture_raw_payload else False
         removed, paths = self.store.cleanup_expired()
         media_removed = self.media.remove_paths(paths)
         logger.info(
-            "[quote-cache] ready: db=%s, ttl=%sh, expired=%s, media_removed=%s",
+            "[quote-cache] ready: db=%s, ttl=%sh, expired=%s, media_removed=%s, raw_bridge=%s",
             self.store.db_path,
             self.store.ttl_seconds // 3600,
             removed,
             media_removed,
+            bridge_installed,
         )
         if self.auto_cleanup_enabled:
             self._cleanup_task = asyncio.create_task(
@@ -137,6 +145,7 @@ class QuoteCachePlugin(Star):
             except asyncio.CancelledError:
                 pass
         await self.media.close()
+        self.raw_bridge.restore()
         self.store.close()
 
     async def _cleanup_loop(self) -> None:
@@ -194,19 +203,21 @@ class QuoteCachePlugin(Star):
     async def _cache_inbound(self, event: AstrMessageEvent) -> None:
         message_obj = event.message_obj
         raw = value(message_obj, "raw_message")
+        captured = event.get_extra("quote_cache_raw_payload", None)
+        source = captured or raw
         components, attachments, outline = serialize_chain(
             value(message_obj, "message", []) or []
         )
         if not attachments:
-            attachments = raw_attachments(raw)
+            attachments = raw_attachments(source)
         attachments = await self._persist_attachments(attachments)
         aliases = current_aliases(event)
         alias_map = dict(aliases)
         astr_id = str(value(message_obj, "message_id", "") or "")
         original_id = str(
-            value(raw, "id", "")
-            or value(raw, "message_id", "")
-            or value(raw, "msg_id", "")
+            value(source, "id", "")
+            or value(source, "message_id", "")
+            or value(source, "msg_id", "")
             or ""
         )
         ref_index = next(
@@ -218,14 +229,14 @@ class QuoteCachePlugin(Star):
             "",
         )
         metadata = raw_metadata(event)
-        author = value(raw, "author")
+        author = value(source, "author")
         sender_is_bot = bool(value(author, "bot", False)) or (
             bool(self._bot_id(event))
             and str(event.get_sender_id() or "") == self._bot_id(event)
         )
         now = int(time.time())
         timestamp = parse_timestamp(
-            value(message_obj, "timestamp", value(raw, "timestamp")), now
+            value(message_obj, "timestamp", value(source, "timestamp")), now
         )
         record = CachedMessage(
             scope_key=self._scope_key(event),
@@ -351,10 +362,50 @@ class QuoteCachePlugin(Star):
 
         event._post_send = wrapped_post_send
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize - 20)
+    def _ensure_reply_component(self, event: AstrMessageEvent) -> list[str]:
+        """Materialize a Reply segment so an otherwise empty quote reaches the LLM.
+
+        AstrBot's internal agent skips events with no text, media, provider request,
+        or Reply component. QQ Official botpy does not create that component for
+        quote payloads, so ``quote + @bot`` used to stop before on_llm_request.
+        """
+        chain = value(event.message_obj, "message", [])
+        if not isinstance(chain, list):
+            return reference_aliases(event)
+        refs = reference_aliases(event)
+        if not refs or any(isinstance(comp, Reply) for comp in chain):
+            return refs
+        entry = self.store.find(self._scope_key(event), refs)
+        kwargs: dict[str, Any] = {"id": refs[0]}
+        if entry:
+            kwargs.update(
+                {
+                    "sender_id": entry.sender_id,
+                    "sender_nickname": entry.sender_name,
+                    "time": entry.timestamp,
+                    "message_str": entry.content,
+                }
+            )
+        chain.insert(0, Reply(**kwargs))
+        event.set_extra(
+            "quote_cache_synthetic_reply",
+            {"reference_ids": refs, "cache_hit": bool(entry)},
+        )
+        logger.info(
+            "[quote-cache] materialized Reply component: refs=%s cache_hit=%s",
+            refs,
+            bool(entry),
+        )
+        return refs
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=sys.maxsize)
     async def capture_message(self, event: AstrMessageEvent) -> None:
         if not self._platform_allowed(event):
             return
+        payload = self.raw_bridge.take(value(event.message_obj, "raw_message"))
+        if payload:
+            event.set_extra("quote_cache_raw_payload", payload)
+        self._ensure_reply_component(event)
         self._install_send_capture(event)
         try:
             await self._cache_inbound(event)
@@ -579,8 +630,11 @@ class QuoteCachePlugin(Star):
             "引用缓存调试\n"
             f"raw 类型：{metadata.get('raw_type')}\n"
             f"raw 字段：{', '.join(metadata.get('raw_keys', [])) or '(空)'}\n"
+            f"捕获原始 payload：{'是' if metadata.get('captured_payload') else '否'}\n"
+            f"payload 字段：{', '.join(metadata.get('captured_keys', [])) or '(空)'}\n"
             f"event extra：{', '.join(metadata.get('event_extra_keys', [])) or '(空)'}\n"
             f"message_type：{metadata.get('message_type')}\n"
+            f"message_reference：{metadata.get('message_reference_id') or '(无)'}\n"
             f"当前消息索引：{current or '(未发现)'}\n"
             f"引用目标索引：{refs or '(未发现)'}\n"
             f"内嵌引用：{fallback.get('source') if fallback else '(无)'}\n"

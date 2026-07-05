@@ -55,6 +55,12 @@
     "default": true,
     "hint": "使用 QQ 官方事件的内部发送函数做兼容包装；若对应 AstrBot 版本没有该函数会自动跳过。"
   },
+  "capture_raw_payload_bridge": {
+    "description": "在 botpy 丢弃引用字段前旁路保留原始 payload",
+    "type": "bool",
+    "default": true,
+    "hint": "QQ 官方 WebSocket/Webhook 引用修复的关键开关。仅局部包装 botpy 消息构造器，不替换平台适配器；修改后需重载插件。"
+  },
   "inject_images": {
     "description": "将被引用消息中的图片加入 LLM 图片输入",
     "type": "bool",

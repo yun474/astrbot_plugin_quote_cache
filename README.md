@@ -7,6 +7,9 @@
 - 缓存收到的文本、图片、语音、视频、文件及常见消息段结构。
 - 一条消息可同时使用 AstrBot 消息 ID、QQ 原始 ID、REFIDX 等多个索引查询。
 - 优先解析 AstrBot `Reply.id`，并兼容 `message_scene.ext`、`message_type == 103` 与 `msg_elements[0]`。
+- 直接识别 botpy 保留下来的 `message_reference.message_id`。
+- 在 botpy 构造消息对象前旁路保存完整 payload，避免 WebSocket/Webhook 引用字段被 `__slots__` 丢弃。
+- 对“只引用并 @机器人、没有额外文字”的事件补建 AstrBot `Reply` 段，避免 Agent 把它当空消息跳过。
 - 尝试读取 QQ 官方发送接口回包中的 `id/ref_idx/msg_idx`，把机器人回复也加入缓存。
 - 图片加入 `ProviderRequest.image_urls`，语音加入 `audio_urls`；文件和视频以结构化说明注入，小型文本文件还会附带内容预览。
 - 默认保留 48 小时，每小时自动清理一次；按机器人实例和群聊/私聊隔离索引。
@@ -62,10 +65,12 @@ data/plugin_data/astrbot_plugin_quote_cache/
 ## 查询与注入顺序
 
 1. 从 AstrBot 消息链的 `Reply.id` 查引用目标。
-2. 从 `raw_message` 和 `event extra` 的 `message_scene.ext/ref_msg_idx` 等字段查目标。
-3. 在当前作用域的 SQLite 别名表中查询。
-4. 缓存未命中且 `message_type == 103` 时，解析 `msg_elements[0]` 并补写缓存。
-5. 将引用文本作为额外用户内容块注入；旧版 AstrBot 没有该接口时退回到当前 prompt 前缀。
+2. 从 botpy 的 `message_reference.message_id` 查 QQ 原始消息 ID。
+3. 从旁路保留的 payload、`raw_message` 和 `event extra` 的 `message_scene.ext/ref_msg_idx` 查 REFIDX。
+4. 若适配器没有生成 `Reply` 消息段，则在插件事件阶段补建，保证空引用也会进入 Agent。
+5. 在当前作用域的 SQLite 别名表中查询。
+6. 缓存未命中且 `message_type == 103` 时，解析 `msg_elements[0]` 并补写缓存。
+7. 将引用文本作为额外用户内容块注入；旧版 AstrBot 没有该接口时退回到当前 prompt 前缀。
 
 插件不会修改 `event.message_str` 或 AstrBot 的原始消息链，因此不会影响指令匹配。新版 AstrBot 若已经注入了 `<Quoted Message>`，本插件不会重复添加文本，但仍会补充本地缓存命中的图片和语音输入。
 
@@ -95,3 +100,5 @@ data/plugin_data/astrbot_plugin_quote_cache/
 4. 引用机器人回复再测试一次；若只在这一步失败，重点看日志中是否出现 `outgoing response had no usable ID`。
 
 如果调试结果里既没有 `Reply.id`，也没有 `message_scene/msg_elements/ref_msg_idx`，那就是适配器进入插件层前已丢弃引用关系。普通 Star 插件无法凭空恢复目标 ID，此时只能升级/修补 QQ 官方适配器，或改用保留完整 payload 的平台适配器插件。
+
+从 v0.2.0 起，插件默认开启 `capture_raw_payload_bridge`，会在 botpy 消息对象构造入口保存一份短期 payload 旁路，因此正常情况下调试信息会显示“捕获原始 payload：是”。升级后必须重载插件或重启 AstrBot，旧进程中的 v0.1.x 不会自动获得这个构造器包装。
