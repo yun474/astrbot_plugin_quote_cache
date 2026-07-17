@@ -1,2 +1,1 @@
-# No additional dependency. aiohttp is provided by AstrBot and is only used for
-# optional attachment persistence.
+# No additional runtime dependencies.

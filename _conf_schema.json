@@ -1,87 +1,76 @@
 {
   "enabled": {
-    "description": "启用引用消息缓存与上下文注入",
+    "description": "启用历史消息缓存",
     "type": "bool",
     "default": true
+  },
+  "enable_llm_search": {
+    "description": "允许 LLM 主动调用历史消息搜索工具",
+    "type": "bool",
+    "default": true,
+    "hint": "会注册 search_chat_history 和 get_chat_history_context 两个工具。工具只能读取当前群聊或当前私聊。"
   },
   "platform_allowlist": {
     "description": "启用的平台适配器名称",
     "type": "string",
-    "default": "qq_official,qq_official_webhook",
-    "hint": "逗号或换行分隔；留空表示所有平台。平台实例 ID 不同的话也可直接填实例 ID。"
+    "default": "",
+    "hint": "逗号或换行分隔；留空表示所有平台。可填写适配器名称或平台实例 ID。"
   },
-  "ttl_hours": {
-    "description": "缓存保留时间（小时）",
+  "retention_days": {
+    "description": "历史消息保留天数",
     "type": "int",
-    "default": 48,
-    "hint": "默认两天。超过此时间的消息和附件会在下一次清理时删除。"
+    "default": 90,
+    "hint": "0 表示不按时间过期；仍会受到消息数量上限约束。"
+  },
+  "max_entries": {
+    "description": "全库消息数量上限",
+    "type": "int",
+    "default": 200000,
+    "hint": "超过上限时优先删除最早写入的记录。"
+  },
+  "cache_bot_responses": {
+    "description": "缓存 AstrBot 发出的回复",
+    "type": "bool",
+    "default": true
+  },
+  "max_message_chars": {
+    "description": "单条消息最多缓存的字符数",
+    "type": "int",
+    "default": 6000
+  },
+  "default_result_limit": {
+    "description": "LLM 搜索默认返回条数",
+    "type": "int",
+    "default": 8
+  },
+  "max_result_limit": {
+    "description": "单次搜索允许返回的最大条数",
+    "type": "int",
+    "default": 20,
+    "hint": "代码层最大限制为 50，避免一次工具调用塞入过多聊天记录。"
+  },
+  "fuzzy_threshold": {
+    "description": "近似匹配最低相似度",
+    "type": "float",
+    "default": 0.58,
+    "hint": "范围 0.30 到 0.95；越低越容易搜到错别字，也越容易出现无关结果。"
+  },
+  "fuzzy_candidate_limit": {
+    "description": "近似匹配候选消息数",
+    "type": "int",
+    "default": 3000,
+    "hint": "子串和多关键词搜索会查完整有效缓存；只有错别字近似匹配受此候选窗口限制。"
   },
   "auto_cleanup_enabled": {
-    "description": "启用周期性自动清理",
+    "description": "启用周期性过期清理",
     "type": "bool",
-    "default": true,
-    "hint": "关闭后仍可使用 /引用缓存清理 手动删除过期缓存。插件启动时始终会清理一次已过期数据。"
+    "default": true
   },
   "cleanup_interval_minutes": {
     "description": "自动清理扫描周期（分钟）",
     "type": "int",
     "default": 60,
-    "hint": "仅在启用周期性自动清理时生效，最小 5 分钟。"
-  },
-  "max_entries": {
-    "description": "缓存消息数量上限",
-    "type": "int",
-    "default": 50000
-  },
-  "attachment_cache_mode": {
-    "description": "附件缓存模式",
-    "type": "string",
-    "default": "lazy",
-    "options": ["lazy", "eager"],
-    "hint": "lazy：收到消息时只存 ID、URL 和元数据，被引用时才下载；eager：收到图片、语音、视频或文件时立即下载，引用更稳但更耗带宽和磁盘。"
-  },
-  "max_attachment_mb": {
-    "description": "单个缓存附件最大大小（MB）",
-    "type": "int",
-    "default": 50
-  },
-  "download_timeout_seconds": {
-    "description": "远程附件下载超时（秒）",
-    "type": "int",
-    "default": 20
-  },
-  "capture_outgoing_ids": {
-    "description": "尝试捕获 QQ 官方发送回包并缓存机器人回复",
-    "type": "bool",
-    "default": true,
-    "hint": "使用 QQ 官方事件的内部发送函数做兼容包装；若对应 AstrBot 版本没有该函数会自动跳过。"
-  },
-  "capture_raw_payload_bridge": {
-    "description": "在 botpy 丢弃引用字段前旁路保留原始 payload",
-    "type": "bool",
-    "default": true,
-    "hint": "QQ 官方 WebSocket/Webhook 引用修复的关键开关。仅局部包装 botpy 消息构造器，不替换平台适配器；修改后需重载插件。"
-  },
-  "inject_images": {
-    "description": "将被引用消息中的图片加入 LLM 图片输入",
-    "type": "bool",
-    "default": true
-  },
-  "inject_audio": {
-    "description": "将被引用消息中的语音加入 LLM 音频输入",
-    "type": "bool",
-    "default": true
-  },
-  "max_injected_text_length": {
-    "description": "单次引用注入的最大字符数",
-    "type": "int",
-    "default": 12000
-  },
-  "file_preview_chars": {
-    "description": "文本类文件注入的最大预览字符数",
-    "type": "int",
-    "default": 8000,
-    "hint": "设置为 0 可关闭文件内容预览。"
+    "hint": "最小 5 分钟。"
   },
   "admin_user_ids": {
     "description": "额外允许使用缓存管理指令的用户 ID",

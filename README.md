@@ -1,119 +1,93 @@
-# AstrBot QQ 引用消息缓存
+# AstrBot 历史消息搜索
 
-这个插件用于弥补 QQ 官方适配器无法稳定向普通 Star 插件提供引用内容的问题。它优先使用 AstrBot 已分发的消息 ID 建库，同时保留 QQ 原始消息 ID、`msg_idx`、`ref_msg_idx`、发送回包 ID 等别名。用户引用历史消息时，插件会在同一机器人实例、同一群或同一私聊作用域内查库，并在调用 LLM 前注入引用内容。
+这个插件由原来的“QQ 引用消息缓存”改造而来。AstrBot 已经修好引用消息后，旧补丁终于可以光荣退休了；现在插件只做一件更实用的事：按会话保存 AstrBot 实际收到的消息，并把历史搜索能力注册成 LLM 工具。
 
-## 能做什么
+仓库名和数据目录暂时保留为 `astrbot_plugin_quote_cache`，这样从旧版本升级时可以直接继续读取原来的 SQLite 数据库，不用折腾迁移。
 
-- 缓存收到的文本、图片、语音、视频、文件元数据及常见消息段结构。
-- 一条消息可同时使用 AstrBot 消息 ID、QQ 原始 ID、REFIDX 等多个索引查询。
-- 优先解析 AstrBot `Reply.id`，并兼容 `message_scene.ext`、`message_type == 103` 与 `msg_elements[0]`。
-- 直接识别 botpy 保留下来的 `message_reference.message_id`。
-- 在 botpy 构造消息对象前旁路保存完整 payload，避免 WebSocket/Webhook 引用字段被 `__slots__` 丢弃。
-- 对“只引用并 @机器人、没有额外文字”的事件补建 AstrBot `Reply` 段，避免 Agent 把它当空消息跳过。
-- 尝试读取 QQ 官方发送接口回包中的 `id/ref_idx/msg_idx`，把机器人回复也加入缓存。
-- 图片加入 `ProviderRequest.image_urls`，语音加入 `audio_urls`；文件和视频以结构化说明注入，小型文本文件还会附带内容预览。
-- 默认保留 48 小时，每小时自动清理一次；按机器人实例和群聊/私聊隔离索引。
+## 功能
 
-## 安装
+- 自动缓存 AstrBot 收到的消息，以及 AstrBot 最终发出的回复。
+- 群聊、私聊和不同平台实例严格隔离；LLM 只能搜索当前事件所在的会话。
+- `search_chat_history` 支持正文子串、多关键词、发送者筛选、最近天数筛选和错别字近似匹配。
+- `get_chat_history_context` 可根据搜索结果的 `record_id` 读取前后消息，避免第一次搜索就塞入一大坨上下文。
+- 图片不下载、不保存 URL，只写成 `[图片]`；语音、视频、文件也只保留占位符或文件名。
+- 无第三方运行依赖，搜索和存储都使用 Python 自带的 SQLite。
+- 管理员可查看状态、清理当前会话、清理全部或只清理过期记录。
 
-将整个 `astrbot_plugin_quote_cache` 目录放入 AstrBot 插件目录，或在管理面板上传本目录的 zip 包，然后重载插件。
+## LLM 工具
 
-也可以直接使用仓库地址安装：
+插件会注册两个工具：
+
+### `search_chat_history`
+
+参数：
+
+- `query`：关键词或短句；用空格分隔多个关键词时要求正文同时包含这些词。
+- `limit`：返回条数。
+- `sender`：可选，按昵称或用户 ID 片段筛选。
+- `days_ago`：可选，只查最近若干天；`0` 表示全部有效缓存。
+
+搜索优先执行完整缓存范围内的子串和多关键词匹配。如果结果不足，再对最近的候选消息做近似匹配。近似匹配候选数由 `fuzzy_candidate_limit` 控制，避免每次因为一个错别字就把几十万条消息全拉进 Python 算相似度。
+
+### `get_chat_history_context`
+
+参数：
+
+- `record_id`：第一次搜索返回的记录 ID。
+- `before`：读取目标记录之前多少条，最多 20。
+- `after`：读取目标记录之后多少条，最多 20。
+
+两种工具返回的聊天正文都会明确标注为“不可信资料”，提醒模型不要把历史消息中的文字当成系统指令执行。
+
+## 安装与升级
+
+可在 AstrBot 插件管理页面使用仓库地址安装：
 
 ```text
 https://github.com/yun474/astrbot_plugin_quote_cache
 ```
 
-默认只处理 `qq_official` 和 `qq_official_webhook`。如果你的平台实例 ID 或适配器名称不同，在插件配置的 `platform_allowlist` 中追加实际名称；留空则处理所有平台。
-
-## 附件缓存模式
-
-配置项 `attachment_cache_mode` 提供两种模式：
-
-| 模式 | 收到普通消息时 | 消息被引用时 | 特点 |
-|---|---|---|---|
-| `lazy`（默认） | 只保存消息 ID、REFIDX、附件 URL 与元数据 | 优先用本次引用 payload 的新 URL 下载；没有新 URL 时回退历史 URL | 大幅减少服务器带宽和磁盘占用，但历史 URL 过期且引用事件不带附件时可能无法恢复媒体 |
-| `eager` | 立即下载图片、语音、视频和文件 | 直接读取本地缓存 | 引用最稳定，但群内所有媒体都会产生一次服务器下行流量并占用磁盘 |
-
-QQ 官方的 Group/C2C SDK 当前没有提供一个通用的“按历史消息 ID 重新获取完整消息附件”方法。因此 `lazy` 并不是只凭 ID 向 API 回查，而是优先使用引用事件 `message_type=103/msg_elements[0]` 中平台重新下发的附件 URL；只有该字段缺失时才尝试消息库保存的旧 URL。
-
-旧版 `persist_attachments=true/false` 仍做兼容：配置文件还没有 `attachment_cache_mode` 时，会分别按 `eager/lazy` 解释。
-
-## 自动清理配置
-
-管理面板中可以直接调整以下三项：
-
-| 配置项 | 默认值 | 作用 |
-|---|---:|---|
-| `auto_cleanup_enabled` | `true` | 是否运行后台周期清理任务；关闭后手动清理指令仍可用 |
-| `ttl_hours` | `48` | 单条消息及附件保留多久，默认两天 |
-| `cleanup_interval_minutes` | `60` | 每隔多久扫描并删除过期缓存，最小 5 分钟 |
-
-插件每次启动时都会先清理一次已经过期的缓存。后台任务只删除超过 `ttl_hours` 的数据，不会因为扫描周期到达就清空仍在有效期内的消息。
-
-## 缓存位置
-
-插件数据位于 AstrBot 数据目录下：
+如果从 v0.x 升级，插件会继续使用：
 
 ```text
-data/plugin_data/astrbot_plugin_quote_cache/
-├── messages.sqlite3       # 消息、发送者、各类消息 ID、附件元数据
-├── messages.sqlite3-wal   # SQLite 运行时文件，存在时不要单独删除
-├── messages.sqlite3-shm   # SQLite 运行时文件，存在时不要单独删除
-└── media/                 # 两天内引用可能使用的图片、语音、视频和文件
+data/plugin_data/astrbot_plugin_quote_cache/messages.sqlite3
 ```
 
-缓存中可能包含聊天内容和附件。备份、迁移或向他人发送 AstrBot 数据目录前，请自行确认隐私范围。
+数据库表结构仍然是原来的 `messages + aliases`。旧版本已经过期或已经被清理的记录无法恢复；旧库里残留的附件元数据仍能被读取，但 v1.0.0 不会把它们返回给 LLM，也不会再下载新附件。
 
-## 指令
+升级后旧版的引用注入、QQ 原始 payload 旁路和附件落盘配置全部失效，可以在面板中删除那些旧配置。
 
-以下指令仅限 AstrBot 管理员，或配置项 `admin_user_ids` 中列出的用户：
+## 主要配置
 
-- `/引用缓存状态`：显示当前会话和全库条目数、TTL 与实际缓存路径。
-- `/引用缓存清理`：立即删除所有已经过期的消息和媒体。
-- `/引用缓存清理 当前会话`：清空当前群或当前私聊缓存。
-- `/引用缓存清理 全部`：清空整个插件缓存。
-- `/引用缓存调试`：建议“回复一条消息”后执行；显示当前事件的 raw 类型、可见字段、当前消息索引、引用目标索引、103 内嵌引用和缓存命中情况。
+| 配置项 | 默认值 | 说明 |
+|---|---:|---|
+| `enabled` | `true` | 启用消息缓存 |
+| `enable_llm_search` | `true` | 向 LLM 提供两个历史工具 |
+| `platform_allowlist` | 空 | 留空支持所有平台；可按适配器名或实例 ID 限制 |
+| `retention_days` | `90` | 保留天数；`0` 表示不按时间过期 |
+| `max_entries` | `200000` | 全库消息数上限 |
+| `cache_bot_responses` | `true` | 缓存 AstrBot 发出的最终回复 |
+| `max_message_chars` | `6000` | 单条正文缓存长度上限 |
+| `default_result_limit` | `8` | 默认搜索结果数 |
+| `max_result_limit` | `20` | 单次最多返回多少条 |
+| `fuzzy_threshold` | `0.58` | 近似匹配阈值，越低越宽松 |
+| `fuzzy_candidate_limit` | `3000` | 错别字近似匹配最多检查多少条最近消息 |
+| `auto_cleanup_enabled` | `true` | 周期清理过期消息 |
+| `cleanup_interval_minutes` | `60` | 清理周期 |
 
-## 查询与注入顺序
+## 管理命令
 
-1. 从 AstrBot 消息链的 `Reply.id` 查引用目标。
-2. 从 botpy 的 `message_reference.message_id` 查 QQ 原始消息 ID。
-3. 从旁路保留的 payload、`raw_message` 和 `event extra` 的 `message_scene.ext/ref_msg_idx` 查 REFIDX。
-4. 若适配器没有生成 `Reply` 消息段，则在插件事件阶段补建，保证空引用也会进入 Agent。
-5. 在当前作用域的 SQLite 别名表中查询。
-6. 缓存未命中且 `message_type == 103` 时，解析 `msg_elements[0]` 并补写缓存。
-7. 将引用文本作为额外用户内容块注入；旧版 AstrBot 没有该接口时退回到当前 prompt 前缀。
+以下命令仅限 AstrBot 管理员或 `admin_user_ids` 中列出的用户：
 
-插件不会修改 `event.message_str` 或 AstrBot 的原始消息链，因此不会影响指令匹配。新版 AstrBot 若已经注入了 `<Quoted Message>`，本插件不会重复添加文本，但仍会补充本地缓存命中的图片和语音输入。
+- `/历史消息状态`
+- `/历史消息清理`：只清理过期记录。
+- `/历史消息清理 当前会话`
+- `/历史消息清理 全部`
 
-## 机器人回复缓存的边界
+## 边界和隐私
 
-普通 Star 插件通常看不到 QQ 发送接口的返回值。本插件会对 QQ 官方事件实例的 `_post_send` 做一次局部兼容包装，在不修改 AstrBot 源码的前提下读取回包 ID。该接口是 AstrBot 的内部实现：
+插件只能缓存平台适配器实际交给 AstrBot 的消息。某些平台不会把未提及机器人的普通群消息推给机器人，这种情况下插件不可能凭空得到完整群历史，别拿它当 QQ 聊天记录导出器使唤，真没有。
 
-- 当前版本存在 `_post_send` 且 QQ 回包含 `id/ref_idx/msg_idx` 时，可以缓存机器人回复。
-- 旧版或魔改版没有该方法、流式回包没有可用索引时会自动跳过，不影响正常发送。
-- 即使机器人回复索引没有捕获，`message_type == 103` 的 `msg_elements[0]` 仍可作为最后兜底。
+数据库包含真实聊天正文、发送者 ID 和昵称。备份、迁移或分享 AstrBot 数据目录前，请先确认隐私范围。LLM 工具虽然做了当前会话隔离，但最终仍会把命中的正文交给当前使用的模型服务商。
 
-先开启 `debug_log` 并观察 `[quote-cache] outbound cached`，即可确认你的版本有没有拿到机器人回复索引。
-
-## 附件安全与限制
-
-- `eager` 模式会在入站时复制或下载附件；`lazy` 模式只在引用命中时落地媒体。
-- HTTP(S) 附件下载前会解析 DNS，并拒绝回环、内网、链路本地、保留地址和带用户名密码的 URL；重定向目标也会重新检查。
-- 单个附件默认最大 50 MB，下载超时默认 20 秒，均可在配置中调整。
-- 文件/视频是否能被模型直接理解取决于 LLM 提供商。本插件保证缓存并注入元数据；常见纯文本文件会额外注入预览。
-- 语音能否被模型听懂取决于提供商是否支持 `audio_urls`。若 QQ payload 带 `asr_refer_text`，该转写也会进入引用说明。
-
-## 首次验证建议
-
-1. 在群里连续发送一条文字和一张图片，再引用它们并 @机器人。
-2. 回复原消息执行 `/引用缓存调试`，确认“引用目标索引”与“缓存命中”为正常值。
-3. 查看日志是否出现 `[quote-cache] quote hit`。
-4. 引用机器人回复再测试一次；若只在这一步失败，重点看日志中是否出现 `outgoing response had no usable ID`。
-
-如果调试结果里既没有 `Reply.id`，也没有 `message_scene/msg_elements/ref_msg_idx`，那就是适配器进入插件层前已丢弃引用关系。普通 Star 插件无法凭空恢复目标 ID，此时只能升级/修补 QQ 官方适配器，或改用保留完整 payload 的平台适配器插件。
-
-从 v0.2.0 起，插件默认开启 `capture_raw_payload_bridge`，会在 botpy 消息对象构造入口保存一份短期 payload 旁路，因此正常情况下调试信息会显示“捕获原始 payload：是”。升级后必须重载插件或重启 AstrBot，旧进程中的 v0.1.x 不会自动获得这个构造器包装。
-
-v0.2.1 起支持在 AstrBot 面板中反复停用、启用插件：SQLite 连接、后台清理任务和 botpy payload 旁路都会随生命周期安全关闭并重新创建。
+主动调用工具还要求当前模型支持 function calling，并且该工具没有在 AstrBot 的工具管理页面被停用。模型是否会在合适的时候主动搜索，也会受到人格提示词和模型本身工具调用能力影响。

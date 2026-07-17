@@ -1,33 +1,31 @@
 # Changelog
 
-## v0.3.0
+## v1.0.0
 
-- 新增 `attachment_cache_mode`，支持 `lazy`（引用时下载）和 `eager`（收到时下载）。
-- 新安装默认使用 `lazy`，普通消息只保存消息 ID、REFIDX、附件 URL 与元数据。
-- 懒加载优先采用当前引用事件 `msg_elements[0]` 中的新附件地址，失败时回退历史 URL。
-- 已经成功懒加载的媒体会复用本地文件，不会在每次引用时重复下载。
-- 兼容旧版 `persist_attachments` 配置：未出现新配置项时，`true/false` 分别映射为 `eager/lazy`。
+- 将插件从 QQ 引用消息兼容补丁改造为跨平台历史消息搜索插件。
+- 保留原有 `messages + aliases` SQLite 结构和数据目录，可直接读取 v0.x 数据库。
+- 新增 LLM 工具 `search_chat_history`，支持当前会话内的子串、多关键词、发送者、时间范围和错别字近似搜索。
+- 新增 LLM 工具 `get_chat_history_context`，按搜索结果 ID 读取前后消息。
+- 新增 AstrBot 回复缓存；使用公开的 `on_decorating_result` 钩子，不再包装平台内部发送方法。
+- 图片、语音、视频和文件不再下载，只缓存安全占位符；新记录不保存媒体 URL。
+- 搜索结果严格限制在当前群聊或私聊，并将历史正文标为不可信资料，降低提示注入风险。
+- 移除引用内容注入、QQ botpy 原始 payload 旁路、媒体缓存和附件预览。
+- 默认保留时间调整为 90 天，默认全库上限调整为 200000 条；支持 `retention_days=0` 永不过期。
+- 插件作者更新为云云。
 
-## v0.2.1
+## v0.3.0（旧引用缓存）
 
-- 修复插件停用后 SQLite 已关闭、同一实例再次启用时无法初始化的问题。
-- 初始化时自动重建已关闭的消息库，清理任务与 botpy payload 旁路支持重复启停。
-- `terminate()`、SQLite `close()` 和 payload bridge `install()` 改为幂等操作。
+- 新增附件懒加载与立即缓存模式。
+- 普通消息保存消息 ID、REFIDX 和附件元数据，用于引用消息恢复。
 
-## v0.2.0
+## v0.2.1（旧引用缓存）
 
-- 修复未解析 botpy `message_reference.message_id`，导致普通引用无法命中缓存的问题。
-- 新增 botpy 原始 payload 旁路，在 `message_scene/message_type/msg_elements` 被 `__slots__` 丢弃前暂存。
-- WebSocket 与 Webhook 共用同一捕获逻辑，缓存事件处理完成后立即释放旁路数据。
-- 自动补建 AstrBot `Reply` 消息段，修复“只引用并 @机器人”被 Agent 当作空消息跳过的问题。
-- `/引用缓存调试` 增加原始 payload 捕获状态、字段列表及 `message_reference` ID。
+- 修复插件反复停用、启用时的 SQLite 与旁路生命周期问题。
 
-## v0.1.1
+## v0.2.0（旧引用缓存）
 
-- 增加 `auto_cleanup_enabled` 周期清理总开关。
-- 明确 `ttl_hours` 缓存保留时间与 `cleanup_interval_minutes` 扫描周期。
-- README 增加自动清理配置表、仓库安装地址与缓存位置说明。
+- 增加 QQ 官方 botpy 原始 payload 旁路和引用消息字段兼容。
 
-## v0.1.0
+## v0.1.0（旧引用缓存）
 
-- 首次发布：SQLite 多索引引用缓存、REFIDX/103 消息解析、富媒体上下文注入、机器人发送回包捕获与缓存管理指令。
+- 首次发布 SQLite 多索引引用消息缓存。
