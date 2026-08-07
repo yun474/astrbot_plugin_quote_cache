@@ -1,7 +1,11 @@
 import unittest
 from enum import Enum
 
-from astrbot_plugin_quote_cache.message_codec import history_outline, message_aliases
+from astrbot_plugin_quote_cache.message_codec import (
+    extract_group_name,
+    history_outline,
+    message_aliases,
+)
 
 
 class Plain:
@@ -33,6 +37,28 @@ class ComponentType(Enum):
 
 
 class CodecTests(unittest.TestCase):
+    def test_group_name_prefers_standard_astrbot_group(self):
+        message_obj = type(
+            "Message",
+            (),
+            {
+                "group": type("Group", (), {"group_name": "云云的猫窝"})(),
+                "raw_message": {"group_name": "原始群名"},
+            },
+        )()
+        self.assertEqual(extract_group_name(message_obj), "云云的猫窝")
+
+    def test_group_name_can_use_adapter_raw_payload(self):
+        message_obj = {"raw_message": {"channel": {"name": "闲聊频道"}}}
+        self.assertEqual(extract_group_name(message_obj), "闲聊频道")
+
+    def test_group_name_is_empty_when_official_payload_only_has_openid(self):
+        message_obj = {
+            "group": {"group_name": None},
+            "raw_message": {"group_openid": "opaque-openid"},
+        }
+        self.assertEqual(extract_group_name(message_obj), "")
+
     def test_history_outline_uses_media_placeholders_without_urls(self):
         content, components = history_outline(
             [

@@ -49,6 +49,27 @@ def message_aliases(message_obj: Any) -> list[tuple[str, str]]:
     return list(result.items())
 
 
+def extract_group_name(message_obj: Any) -> str:
+    """Read a group name exposed by the adapter without making network calls."""
+    raw = value(message_obj, "raw_message")
+    candidates = [
+        value(value(message_obj, "group"), "group_name"),
+        value(raw, "group_name"),
+        value(raw, "guild_name"),
+        value(raw, "channel_name"),
+        value(value(raw, "group"), "name"),
+        value(value(raw, "guild"), "name"),
+        value(value(raw, "channel"), "name"),
+    ]
+    for candidate in candidates:
+        if candidate is None or isinstance(candidate, (dict, list, tuple, set)):
+            continue
+        text = str(candidate).strip()
+        if text and text.casefold() not in {"n/a", "none", "null"}:
+            return text
+    return ""
+
+
 def _component_type(component: Any) -> str:
     class_name = component.__class__.__name__.lower()
     if class_name not in {"dict", "object", "basemessagecomponent"}:

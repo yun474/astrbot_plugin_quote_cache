@@ -21,6 +21,7 @@ class CachedMessage:
     platform_name: str
     session_id: str
     group_id: str
+    group_name: str
     message_type: str
     astr_message_id: str
     original_message_id: str
@@ -84,11 +85,18 @@ def _partial_ratio(query: str, content: str) -> float:
 class MessageStore:
     """Thread-safe SQLite message cache with session-scoped history search."""
 
-    def __init__(self, db_path: Path, ttl_seconds: int, max_entries: int = 200000):
+    def __init__(
+        self,
+        db_path: Path,
+        ttl_seconds: int,
+        max_entries: int = 200000,
+        max_entries_per_group: int = 0,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.ttl_seconds = max(int(ttl_seconds), 0)
-        self.max_entries = max(int(max_entries), 100)
+        self.max_entries = max(int(max_entries), 0)
+        self.max_entries_per_group = max(int(max_entries_per_group), 0)
         self._lock = threading.RLock()
         self._closed = False
         self._writes_since_prune = 0
@@ -100,6 +108,9 @@ class MessageStore:
             self._db.execute("PRAGMA synchronous=NORMAL")
             self._create_schema()
             self._prune_locked(int(time.time()))
+            if self.max_entries_per_group > 0:
+                self._prune_all_groups_locked(self.max_entries_per_group)
+                self._db.commit()
 
     def _create_schema(self) -> None:
         # Keep the v0.x quote-cache schema so existing databases remain readable.
@@ -112,6 +123,7 @@ class MessageStore:
                 platform_name TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL DEFAULT '',
                 group_id TEXT NOT NULL DEFAULT '',
+                group_name TEXT NOT NULL DEFAULT '',
                 message_type TEXT NOT NULL DEFAULT '',
                 astr_message_id TEXT NOT NULL DEFAULT '',
                 original_message_id TEXT NOT NULL DEFAULT '',
@@ -145,6 +157,14 @@ class MessageStore:
                 ON aliases(scope_key, alias);
             """
         )
+        columns = {
+            str(row["name"])
+            for row in self._db.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "group_name" not in columns:
+            self._db.execute(
+                "ALTER TABLE messages ADD COLUMN group_name TEXT NOT NULL DEFAULT ''"
+            )
         self._db.commit()
 
     @staticmethod
@@ -192,6 +212,7 @@ class MessageStore:
                 message.platform_name,
                 message.session_id,
                 message.group_id,
+                message.group_name,
                 message.message_type,
                 message.astr_message_id,
                 message.original_message_id,
@@ -211,20 +232,21 @@ class MessageStore:
                 message_id = int(existing["id"])
                 self._db.execute(
                     """UPDATE messages SET
-                    platform_id=?, platform_name=?, session_id=?, group_id=?, message_type=?,
+                    platform_id=?, platform_name=?, session_id=?, group_id=?, group_name=?,
+                    message_type=?,
                     original_message_id=?, ref_index=?, content=?, sender_id=?, sender_name=?,
                     timestamp=?, is_bot=?, attachments_json=?, components_json=?, raw_meta_json=?,
                     cached_at=?, expires_at=? WHERE id=?""",
-                    values[1:6] + values[7:] + (message_id,),
+                    values[1:7] + values[8:] + (message_id,),
                 )
             else:
                 cur = self._db.execute(
                     """INSERT INTO messages (
-                    scope_key, platform_id, platform_name, session_id, group_id, message_type,
-                    astr_message_id, original_message_id, ref_index, content, sender_id,
+                    scope_key, platform_id, platform_name, session_id, group_id, group_name,
+                    message_type, astr_message_id, original_message_id, ref_index, content, sender_id,
                     sender_name, timestamp, is_bot, attachments_json, components_json,
                     raw_meta_json, cached_at, expires_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     values,
                 )
                 message_id = int(cur.lastrowid)
@@ -233,6 +255,11 @@ class MessageStore:
                     "INSERT OR REPLACE INTO aliases(message_id, scope_key, alias, alias_kind) "
                     "VALUES(?,?,?,?)",
                     (message_id, message.scope_key, alias, kind),
+                )
+            if message.group_id and self.max_entries_per_group > 0:
+                self._prune_scope_locked(
+                    message.scope_key,
+                    self.max_entries_per_group,
                 )
             self._writes_since_prune += 1
             if self._writes_since_prune >= 100:
@@ -250,6 +277,7 @@ class MessageStore:
             platform_name=row["platform_name"],
             session_id=row["session_id"],
             group_id=row["group_id"],
+            group_name=row["group_name"],
             message_type=row["message_type"],
             astr_message_id=row["astr_message_id"],
             original_message_id=row["original_message_id"],
@@ -291,13 +319,17 @@ class MessageStore:
 
     def _base_search_where(
         self,
-        scope_key: str,
+        scope_key: str | None,
         sender: str,
         since_timestamp: int,
         exclude_astr_message_id: str,
+        exclude_scope_key: str,
     ) -> tuple[list[str], list[Any]]:
-        clauses = ["scope_key=?", "expires_at>?"]
-        params: list[Any] = [scope_key, int(time.time())]
+        clauses = ["expires_at>?"]
+        params: list[Any] = [int(time.time())]
+        if scope_key:
+            clauses.append("scope_key=?")
+            params.append(scope_key)
         if sender:
             pattern = f"%{_escape_like(sender)}%"
             clauses.append(
@@ -308,14 +340,17 @@ class MessageStore:
         if since_timestamp > 0:
             clauses.append("timestamp>=?")
             params.append(int(since_timestamp))
-        if exclude_astr_message_id:
+        if exclude_astr_message_id and exclude_scope_key:
+            clauses.append("NOT (scope_key=? AND astr_message_id=?)")
+            params.extend((exclude_scope_key, exclude_astr_message_id))
+        elif exclude_astr_message_id:
             clauses.append("astr_message_id<>?")
             params.append(exclude_astr_message_id)
         return clauses, params
 
     def search(
         self,
-        scope_key: str,
+        scope_key: str | None,
         query: str,
         *,
         limit: int = 8,
@@ -324,6 +359,7 @@ class MessageStore:
         fuzzy_threshold: float = 0.58,
         fuzzy_candidate_limit: int = 3000,
         exclude_astr_message_id: str = "",
+        exclude_scope_key: str = "",
     ) -> list[SearchHit]:
         query = str(query or "").strip()
         if not query:
@@ -338,6 +374,7 @@ class MessageStore:
             str(sender or "").strip(),
             since_timestamp,
             exclude_astr_message_id,
+            exclude_scope_key,
         )
         exact_clauses = list(base_clauses)
         exact_params = list(base_params)
@@ -391,7 +428,7 @@ class MessageStore:
 
     def context(
         self,
-        scope_key: str,
+        scope_key: str | None,
         message_id: int,
         *,
         before: int = 3,
@@ -401,18 +438,24 @@ class MessageStore:
         before = max(0, min(int(before), 20))
         after = max(0, min(int(after), 20))
         with self._lock:
+            anchor_clauses = ["id=?", "expires_at>?"]
+            anchor_params: list[Any] = [int(message_id), now]
+            if scope_key:
+                anchor_clauses.append("scope_key=?")
+                anchor_params.append(scope_key)
             anchor = self._db.execute(
-                "SELECT * FROM messages WHERE id=? AND scope_key=? AND expires_at>?",
-                (int(message_id), scope_key, now),
+                "SELECT * FROM messages WHERE " + " AND ".join(anchor_clauses),
+                anchor_params,
             ).fetchone()
             if not anchor:
                 return []
+            anchor_scope = str(anchor["scope_key"])
             older = self._db.execute(
                 """SELECT * FROM messages WHERE scope_key=? AND expires_at>?
                 AND (timestamp<? OR (timestamp=? AND id<?))
                 ORDER BY timestamp DESC, id DESC LIMIT ?""",
                 (
-                    scope_key,
+                    anchor_scope,
                     now,
                     int(anchor["timestamp"]),
                     int(anchor["timestamp"]),
@@ -425,7 +468,7 @@ class MessageStore:
                 AND (timestamp>? OR (timestamp=? AND id>?))
                 ORDER BY timestamp ASC, id ASC LIMIT ?""",
                 (
-                    scope_key,
+                    anchor_scope,
                     now,
                     int(anchor["timestamp"]),
                     int(anchor["timestamp"]),
@@ -446,7 +489,9 @@ class MessageStore:
     def clear(self, scope_key: str | None = None) -> tuple[int, list[str]]:
         with self._lock:
             if scope_key:
-                cur = self._db.execute("DELETE FROM messages WHERE scope_key=?", (scope_key,))
+                cur = self._db.execute(
+                    "DELETE FROM messages WHERE scope_key=?", (scope_key,)
+                )
             else:
                 cur = self._db.execute("DELETE FROM messages")
             self._db.commit()
@@ -454,15 +499,40 @@ class MessageStore:
 
     def _prune_locked(self, now: int) -> None:
         self._db.execute("DELETE FROM messages WHERE expires_at<=?", (now,))
-        count = int(self._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
-        overflow = count - self.max_entries
-        if overflow > 0:
-            self._db.execute(
-                "DELETE FROM messages WHERE id IN "
-                "(SELECT id FROM messages ORDER BY cached_at ASC LIMIT ?)",
-                (overflow,),
-            )
+        if self.max_entries > 0:
+            count = int(self._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+            overflow = count - self.max_entries
+            if overflow > 0:
+                self._db.execute(
+                    "DELETE FROM messages WHERE id IN "
+                    "(SELECT id FROM messages ORDER BY cached_at ASC, id ASC LIMIT ?)",
+                    (overflow,),
+                )
         self._db.commit()
+
+    def _prune_scope_locked(self, scope_key: str, limit: int) -> None:
+        count = int(
+            self._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE scope_key=?",
+                (scope_key,),
+            ).fetchone()[0]
+        )
+        overflow = count - limit
+        if overflow <= 0:
+            return
+        self._db.execute(
+            "DELETE FROM messages WHERE id IN "
+            "(SELECT id FROM messages WHERE scope_key=? "
+            "ORDER BY cached_at ASC, id ASC LIMIT ?)",
+            (scope_key, overflow),
+        )
+
+    def _prune_all_groups_locked(self, limit: int) -> None:
+        rows = self._db.execute(
+            "SELECT DISTINCT scope_key FROM messages WHERE group_id<>''"
+        ).fetchall()
+        for row in rows:
+            self._prune_scope_locked(str(row["scope_key"]), limit)
 
     def stats(self, scope_key: str | None = None) -> dict[str, Any]:
         now = int(time.time())
@@ -480,12 +550,15 @@ class MessageStore:
                         "SELECT COUNT(*) FROM messages WHERE expires_at>?", (now,)
                     ).fetchone()[0]
                 )
-            aliases = int(self._db.execute("SELECT COUNT(*) FROM aliases").fetchone()[0])
+            aliases = int(
+                self._db.execute("SELECT COUNT(*) FROM aliases").fetchone()[0]
+            )
         return {
             "messages": count,
             "aliases": aliases,
             "ttl_seconds": self.ttl_seconds,
             "max_entries": self.max_entries,
+            "max_entries_per_group": self.max_entries_per_group,
             "db_path": str(self.db_path),
             "db_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
         }

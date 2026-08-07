@@ -8,7 +8,15 @@
     "description": "允许 LLM 主动调用历史消息搜索工具",
     "type": "bool",
     "default": true,
-    "hint": "会注册 search_chat_history 和 get_chat_history_context 两个工具。工具只能读取当前群聊或当前私聊。"
+    "hint": "会注册 search_chat_history 和 get_chat_history_context 两个工具。具体可读取范围由下方搜索工具范围控制。"
+  },
+  "search_scope": {
+    "description": "搜索工具范围",
+    "type": "string",
+    "options": ["group", "global"],
+    "labels": ["分群", "全局"],
+    "default": "group",
+    "hint": "分群仅允许 LLM 读取当前群聊或私聊；全局允许跨所有缓存会话搜索，并会向 LLM 返回命中消息的会话来源。开启全局前请确认隐私风险。"
   },
   "platform_allowlist": {
     "description": "启用的平台适配器名称",
@@ -26,7 +34,13 @@
     "description": "全库消息数量上限",
     "type": "int",
     "default": 200000,
-    "hint": "超过上限时优先删除最早写入的记录。"
+    "hint": "0 表示不限制；超过上限时优先删除全库最早写入的记录。"
+  },
+  "max_entries_per_group": {
+    "description": "单群消息数量上限",
+    "type": "int",
+    "default": 0,
+    "hint": "0 表示不限制；超过上限时优先删除该群最早写入的记录。私聊不受此项限制。"
   },
   "cache_bot_responses": {
     "description": "缓存 AstrBot 发出的回复",
