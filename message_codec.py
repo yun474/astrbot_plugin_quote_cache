@@ -49,6 +49,41 @@ def message_aliases(message_obj: Any) -> list[tuple[str, str]]:
     return list(result.items())
 
 
+def message_identifiers(message_obj: Any) -> tuple[str, str, str]:
+    """Return the native ID, own quote index, and quoted target index.
+
+    AstrBot preserves QQ's unmodelled fields in raw_message.raw_data.
+    Never use Reply.id or nested msg_elements as this message's identity.
+    """
+    raw = value(message_obj, "raw_message")
+    data = value(raw, "raw_data", raw)
+    native_id = clean_id(value(message_obj, "message_id"))
+    for key in ("id", "message_id", "msg_id"):
+        candidate = clean_id(value(data, key) or value(raw, key))
+        if candidate:
+            native_id = candidate
+            break
+    scene = value(data, "message_scene")
+    indices = {}
+    for entry in value(scene, "ext", []) or []:
+        if isinstance(entry, str):
+            key, _, item = entry.partition("=")
+            if key in {"msg_idx", "ref_msg_idx"}:
+                indices[key] = clean_id(item)
+    return native_id, indices.get("msg_idx", ""), indices.get("ref_msg_idx", "")
+
+
+def sent_message_outline(payload: dict) -> tuple[str, list[dict[str, str]]]:
+    """Keep searchable sent text and media placeholders, never upload tokens."""
+    text = value(payload.get("markdown"), "content") or payload.get("content")
+    chain = [{"type": "plain", "text": text}] if text else []
+    if payload.get("media"):
+        chain.append({"type": "富媒体"})
+    if not chain:
+        chain.append({"type": "消息"})
+    return history_outline(chain)
+
+
 def extract_group_name(message_obj: Any) -> str:
     """Read a group name exposed by the adapter without making network calls."""
     raw = value(message_obj, "raw_message")

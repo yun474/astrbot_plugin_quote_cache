@@ -19,9 +19,12 @@ from .message_codec import (
     extract_group_name,
     history_outline,
     message_aliases,
+    message_identifiers,
     parse_timestamp,
+    sent_message_outline,
     value,
 )
+from .qq_send_observer import QQSendObserver
 
 
 PLUGIN_NAME = "astrbot_plugin_quote_cache"
@@ -114,6 +117,7 @@ class HistorySearchPlugin(Star):
         )
         self._cleanup_task: asyncio.Task | None = None
         self._store_lock = asyncio.Lock()
+        self._qq_send_observer: QQSendObserver | None = None
 
     def _new_store(self) -> MessageStore:
         return MessageStore(
@@ -126,6 +130,15 @@ class HistorySearchPlugin(Star):
     async def initialize(self) -> None:
         if self.store.closed:
             self.store = self._new_store()
+        if self.enabled and self.cache_bot_responses and self._qq_send_observer is None:
+            try:
+                from botpy.http import BotHttp
+            except ImportError:
+                logger.info("[history-search] botpy unavailable; QQ send capture disabled")
+            else:
+                self._qq_send_observer = QQSendObserver(
+                    BotHttp, self._cache_qq_send, logger
+                )
         removed, _ = self.store.cleanup_expired()
         logger.info(
             "[history-search] ready: db=%s, retention_days=%s, expired=%s, "
@@ -145,6 +158,9 @@ class HistorySearchPlugin(Star):
             )
 
     async def terminate(self) -> None:
+        if self._qq_send_observer:
+            self._qq_send_observer.close()
+            self._qq_send_observer = None
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -217,13 +233,13 @@ class HistorySearchPlugin(Star):
             event.get_message_str() or "",
         )
         content = self._trim_content(content)
-        if not content:
-            return None
-
         aliases = message_aliases(message_obj)
         astr_message_id = self._current_message_id(event)
-        original_message_id = next(
-            (alias for alias, kind in aliases if kind != "astr_message_id"), ""
+        original_message_id, ref_index, quoted_ref_index = message_identifiers(message_obj)
+        if not content and not (original_message_id or ref_index):
+            return None
+        aliases.extend(
+            [(original_message_id, "original_message_id"), (ref_index, "msg_idx")]
         )
         now = int(time.time())
         timestamp = parse_timestamp(value(message_obj, "timestamp"), now)
@@ -239,7 +255,7 @@ class HistorySearchPlugin(Star):
             message_type=self._message_type(event),
             astr_message_id=astr_message_id,
             original_message_id=original_message_id,
-            ref_index="",
+            ref_index=ref_index,
             content=content,
             sender_id=sender_id,
             sender_name=str(event.get_sender_name() or ""),
@@ -247,7 +263,7 @@ class HistorySearchPlugin(Star):
             is_bot=bool(self_id and sender_id == self_id),
             attachments=[],
             components=components,
-            raw_meta={"source": "message_event"},
+            raw_meta={"source": "message_event", "ref_msg_idx": quoted_ref_index},
         )
         async with self._store_lock:
             message_id = self.store.put(record, aliases)
@@ -273,6 +289,8 @@ class HistorySearchPlugin(Star):
     @filter.on_decorating_result(priority=-sys.maxsize)
     async def capture_bot_response(self, event: AstrMessageEvent) -> None:
         if not self.cache_bot_responses or not self._platform_allowed(event):
+            return
+        if self._uses_qq_receipts(event):
             return
         result = event.get_result()
         chain = value(result, "chain", []) or []
@@ -312,6 +330,80 @@ class HistorySearchPlugin(Star):
                 "[history-search] bot response cached: scope=%s chars=%s",
                 record.scope_key,
                 len(record.content),
+            )
+
+    @staticmethod
+    def _uses_qq_receipts(event: AstrMessageEvent) -> bool:
+        if event.get_platform_name() not in {"qq_official", "qq_official_webhook"}:
+            return False
+        raw = event.message_obj.raw_message
+        # Guild messages use different endpoints; retain their existing cache path.
+        return bool(
+            value(raw, "group_openid") or value(value(raw, "author"), "user_openid")
+        )
+
+    async def _cache_qq_send(self, http, route, payload: dict, response: dict) -> None:
+        if not self.enabled or not self.cache_bot_responses:
+            return
+        for platform in self.context.platform_manager.get_insts():
+            meta = platform.meta()
+            if meta.name not in {"qq_official", "qq_official_webhook"}:
+                continue
+            if platform.client.http is http:
+                break
+        else:
+            return
+        if self.platform_allowlist and not (
+            {str(meta.id).lower(), meta.name.lower()} & self.platform_allowlist
+        ):
+            return
+        is_group = route.path == "/v2/groups/{group_openid}/messages"
+        session_id = str(route.parameters["group_openid" if is_group else "openid"])
+        platform_id = str(meta.id or meta.name)
+        scope_key = f"{platform_id}|{'group' if is_group else 'private'}:{session_id}"
+        message_id = str(response["id"])
+        ref_index = str(value(response.get("ext_info"), "ref_idx", "") or "")
+        content, components = sent_message_outline(payload)
+        record = CachedMessage(
+            scope_key=scope_key,
+            platform_id=platform_id,
+            platform_name=meta.name,
+            session_id=session_id,
+            group_id=session_id if is_group else "",
+            group_name="",
+            message_type="bot_response",
+            astr_message_id=message_id,
+            original_message_id=message_id,
+            ref_index=ref_index,
+            content=self._trim_content(content),
+            sender_id=str(platform.appid),
+            sender_name="AstrBot",
+            timestamp=parse_timestamp(response.get("timestamp"), int(time.time())),
+            is_bot=True,
+            components=components,
+            raw_meta={"source": "qq_send_receipt"},
+        )
+        async with self._store_lock:
+            stream = payload.get("stream")
+            if stream:
+                previous = self.store.find(scope_key, [message_id])
+                index = int(stream.get("index", 0))
+                delta = (
+                    value(payload.get("markdown"), "content")
+                    or payload.get("content")
+                    or ""
+                )
+                record.content = self._trim_content(delta)
+                if previous:
+                    if index <= previous.raw_meta.get("stream_index", -1):
+                        return
+                    if not stream.get("reset", False):
+                        record.content = self._trim_content(previous.content + delta)
+                    record.timestamp = previous.timestamp
+                record.components = [{"type": "plain", "text": record.content}]
+                record.raw_meta["stream_index"] = index
+            self.store.put(
+                record, [(message_id, "original_message_id"), (ref_index, "ref_idx")]
             )
 
     @staticmethod

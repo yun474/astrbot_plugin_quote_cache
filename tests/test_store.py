@@ -35,6 +35,27 @@ def make_message(
 
 
 class StoreTests(unittest.TestCase):
+    def test_receipt_identity_survives_stream_update_and_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cache.db"
+            store = MessageStore(path, ttl_seconds=3600)
+            first = make_message(astr_id="sent-id", content="第一段")
+            first.original_message_id = "sent-id"
+            first.ref_index = "REFIDX_own=="
+            first.is_bot = True
+            record_id = store.put(first, [(first.ref_index, "ref_idx")])
+            update = make_message(astr_id="sent-id", content="第一段 第二段")
+            update.is_bot = True
+            self.assertEqual(store.put(update, []), record_id)
+            store.close()
+            store = MessageStore(path, ttl_seconds=3600)
+            hit = store.find(first.scope_key, ["REFIDX_own=="])
+            self.assertEqual(hit.original_message_id, "sent-id")
+            self.assertEqual(hit.ref_index, "REFIDX_own==")
+            self.assertEqual(hit.content, "第一段 第二段")
+            self.assertIsNone(store.find("another-bot|group:g1", ["REFIDX_own=="]))
+            store.close()
+
     def test_group_name_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MessageStore(Path(tmp) / "cache.db", ttl_seconds=3600)

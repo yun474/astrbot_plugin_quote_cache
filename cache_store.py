@@ -234,7 +234,9 @@ class MessageStore:
                     """UPDATE messages SET
                     platform_id=?, platform_name=?, session_id=?, group_id=?, group_name=?,
                     message_type=?,
-                    original_message_id=?, ref_index=?, content=?, sender_id=?, sender_name=?,
+                    original_message_id=COALESCE(NULLIF(?, ''), original_message_id),
+                    ref_index=COALESCE(NULLIF(?, ''), ref_index),
+                    content=?, sender_id=?, sender_name=?,
                     timestamp=?, is_bot=?, attachments_json=?, components_json=?, raw_meta_json=?,
                     cached_at=?, expires_at=? WHERE id=?""",
                     values[1:7] + values[8:] + (message_id,),

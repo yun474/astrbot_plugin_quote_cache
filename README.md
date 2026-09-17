@@ -6,7 +6,8 @@
 
 ## 功能
 
-- 自动缓存 AstrBot 收到的消息，以及 AstrBot 最终发出的回复。
+- 自动缓存 AstrBot 收到的消息。QQ 官方群聊、单聊按发送成功回执缓存机器人回复，包含分段发送、主动推送和单聊流式输出；其他平台仍在回复装饰阶段缓存正文。
+- 保存原始消息 ID 与 QQ 引用索引 `idx`，复用现有 SQLite 表和会话隔离索引，方便其他插件按引用索引查询原始消息 ID。
 - 群聊、私聊和不同平台实例分别保存；搜索工具默认只读取当前事件所在会话，也可由管理员改为全局范围。
 - `search_chat_history` 支持正文子串、多关键词、发送者筛选、最近天数筛选和错别字近似匹配。
 - `get_chat_history_context` 可根据搜索结果的 `record_id` 读取前后消息，避免第一次搜索就塞入一大坨上下文。
@@ -58,6 +59,42 @@ data/plugin_data/astrbot_plugin_quote_cache/messages.sqlite3
 数据库表结构仍然是原来的 `messages + aliases`。旧版本已经过期或已经被清理的记录无法恢复；旧库里残留的附件元数据仍能被读取，但 v1.0.0 不会把它们返回给 LLM，也不会再下载新附件。
 
 升级后旧版的引用注入、QQ 原始 payload 旁路和附件落盘配置全部失效，可以在面板中删除那些旧配置。
+
+## 消息 ID 与引用索引
+
+QQ 的消息 ID 和引用索引是两种标识，按官方原值保存，不互相转换：
+
+| 来源 | `original_message_id` | `ref_index` |
+|---|---|---|
+| 收到的 QQ 消息 | 原始事件 `id` | `message_scene.ext` 中的 `msg_idx` |
+| QQ 机器人发送成功的回执 | 响应 `id` | 响应 `ext_info.ref_idx` |
+
+收到的 `ref_msg_idx` 指向被引用的另一条消息，单独保存在 `raw_meta.ref_msg_idx`，不会注册成当前消息的别名。解析 `key=value` 时只切分第一个等号，保留 `REFIDX_...==` 的完整值。不会保存同一数组里的 `auth_token`。
+
+原始 ID 和本条消息的引用索引都写入 `aliases`，可使用现有接口读取：
+
+```python
+# scope_key 必须来自当前平台实例和会话，不能跨会话猜测。
+message = store.find(scope_key, [quoted_ref_index])
+if message is not None:
+    native_message_id = message.original_message_id
+    own_ref_index = message.ref_index
+```
+
+这里的 `store` 是缓存插件的 `MessageStore` 实例。群聊 scope 为 `平台实例ID|group:群openid`，单聊为 `平台实例ID|private:用户openid`。这一版只保存和查询标识，不提供撤回命令。
+
+实现依据：
+
+- [QQ 群消息事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/group_at_message_create.html)和[单聊消息事件](https://bot.q.qq.com/wiki/develop/api-v2/autogen/event/c2c_message_create.html)定义 `message_scene.ext` 的索引。
+- [发送群聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_groups_group_openid_messages.post.html)和[发送单聊消息](https://bot.q.qq.com/wiki/develop/api-v2/autogen/api/v2_users_user_openid_messages.post.html)定义回执 `id`、`ext_info.ref_idx`。
+- 对照 [AstrBot QQ 入站适配器](https://github.com/AstrBotDevs/AstrBot/blob/6ddcb2fc088c67b302fb73f45b36d21f16b9fafd/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py)读取 `raw_message.raw_data`；不再添加接收端补丁。
+- 对照 [AstrBot QQ 发送实现](https://github.com/AstrBotDevs/AstrBot/blob/6ddcb2fc088c67b302fb73f45b36d21f16b9fafd/astrbot/core/platform/sources/qqofficial/qqofficial_message_event.py)，在 `botpy.http.BotHttp.request` 返回成功后记录 QQ v2 消息回执。私聊流式直接调用这个入口，主动推送也经过它；普通发送钩子无法统一拿到所有回执。
+
+发送监听只记录属于当前 AstrBot QQ 平台实例的两个发消息接口，支持 WebSocket 和 Webhook；不修改请求与响应。发送失败不入库，缓存失败只记录日志，不触发消息重发；卸载插件时撤销监听。流式正文按分片 `index` 去重追加，`reset` 时覆盖，同一消息 ID 保留一条缓存。富媒体回执没有附件类型信息，因此发出的富媒体正文只记为 `[富媒体]`。
+
+兼容性：插件保留原有 `astrbot_version >=3.4.21` 声明，新增发送监听使用现有 QQ SDK，没有引入新的 AstrBot 事件 API。此次对照的适配器源码为 AstrBot 4.28.1（提交见上方链接），验证包含本地模拟事件、发送回执和 SQLite 测试，并使用 `qq-botpy 1.2.1` 与当前适配器的入站保留字段代码、私聊发送方法完成模拟网络回执验证；未连接真实 QQ 账号。旧适配器若未保留 `raw_data.message_scene`，只能缓存收到消息的 ID，无法补出它的 `msg_idx`；要完整保存入站索引，需要使用保留该字段的适配器。源码核对确认 4.26.8 已保留这个字段，但这里不将它冒充最早支持版本。
+
+历史记录没有保存的真实 ID 或索引无法回填。QQ 未返回索引时保持为空，不按正文猜测匹配；缓存仍遵循保留天数和数量上限。频道消息与 QQ 群聊、单聊接口不同，暂时沿用原有缓存方式。
 
 ## 主要配置
 
