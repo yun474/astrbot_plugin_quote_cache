@@ -70,11 +70,11 @@ class ObserverTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(
             *(
                 self.http.request(target, json=payload)
-                for target, payload in zip(targets, payloads)
+                for target, payload in zip(targets, payloads, strict=True)
             )
         )
         self.assertEqual(self.callback.await_count, 2)
-        for target, payload in zip(targets, payloads):
+        for target, payload in zip(targets, payloads, strict=True):
             self.callback.assert_any_await(self.http, target, payload, self.response)
 
     async def test_unload_disables_an_inflight_capture_and_restores_method(self):

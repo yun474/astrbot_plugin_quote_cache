@@ -13,8 +13,14 @@
   "search_scope": {
     "description": "搜索工具范围",
     "type": "string",
-    "options": ["group", "global"],
-    "labels": ["分群", "全局"],
+    "options": [
+      "group",
+      "global"
+    ],
+    "labels": [
+      "分群",
+      "全局"
+    ],
     "default": "group",
     "hint": "分群仅允许 LLM 读取当前群聊或私聊；全局允许跨所有缓存会话搜索，并会向 LLM 返回命中消息的会话来源。开启全局前请确认隐私风险。"
   },
@@ -96,5 +102,59 @@
     "description": "输出详细缓存调试日志",
     "type": "bool",
     "default": false
+  },
+  "image_cache": {
+    "description": "图片缓存",
+    "type": "object",
+    "hint": "收录 QQ 官方机器人收到的图片，模型按需用 image_cache_list / image_cache_view 查看。平台范围跟随上方平台白名单。",
+    "items": {
+      "enabled": {
+        "description": "启用图片缓存",
+        "type": "bool",
+        "default": true
+      },
+      "retention_hours": {
+        "description": "图片保留小时数",
+        "type": "int",
+        "default": 72,
+        "hint": "按最近一次收录计算，单纯查看不会续期。"
+      },
+      "max_cache_mb": {
+        "description": "全部会话共享的缓存容量上限（MiB）",
+        "type": "int",
+        "default": 512
+      },
+      "max_image_mb": {
+        "description": "单张图片最大原始大小（MiB）",
+        "type": "int",
+        "default": 20,
+        "slider": {
+          "min": 1,
+          "max": 50,
+          "step": 1
+        }
+      },
+      "context_count": {
+        "description": "每轮提示的最近图片条数",
+        "type": "int",
+        "default": 5,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "只包含图片编号、消息来源和时间，不传图片。设为 0 可仅通过查询工具发现图片。"
+      },
+      "max_images_per_message": {
+        "description": "每条消息最多缓存图片数",
+        "type": "int",
+        "default": 20,
+        "slider": {
+          "min": 1,
+          "max": 50,
+          "step": 1
+        }
+      }
+    }
   }
 }

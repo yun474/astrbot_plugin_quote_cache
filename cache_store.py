@@ -5,11 +5,11 @@ import sqlite3
 import threading
 import time
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Iterable
-
+from typing import Any
 
 NEVER_EXPIRES_AT = 253_402_300_799
 

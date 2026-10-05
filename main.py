@@ -11,10 +11,12 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .cache_store import CachedMessage, MessageStore
+from .image_cache import ImageCacheService, has_image_candidate
 from .message_codec import (
     extract_group_name,
     history_outline,
@@ -25,7 +27,6 @@ from .message_codec import (
     value,
 )
 from .qq_send_observer import QQSendObserver
-
 
 PLUGIN_NAME = "astrbot_plugin_quote_cache"
 
@@ -59,6 +60,17 @@ def _split_list(raw: Any) -> set[str]:
         for item in str(raw or "").replace(",", "\n").splitlines()
         if item.strip()
     }
+
+
+class ImageCandidateFilter(filter.CustomFilter):
+    """Wake the image handler only for messages that may carry images."""
+
+    def filter(self, event, cfg):
+        try:
+            return has_image_candidate(event)
+        except Exception as exc:
+            logger.warning("Image cache filter failed (%s)", type(exc).__name__)
+            return False
 
 
 class HistorySearchPlugin(Star):
@@ -118,6 +130,17 @@ class HistorySearchPlugin(Star):
         self._cleanup_task: asyncio.Task | None = None
         self._store_lock = asyncio.Lock()
         self._qq_send_observer: QQSendObserver | None = None
+        self.images = self._new_image_service()
+
+    def _new_image_service(self) -> ImageCacheService:
+        return ImageCacheService(
+            self.context,
+            self.config.get("image_cache") or {},
+            self.data_dir / "image_cache",
+            scope_of=self._scope_key,
+            allowed=self._platform_listed,
+            quotes_bot=self._quotes_bot,
+        )
 
     def _new_store(self) -> MessageStore:
         return MessageStore(
@@ -130,11 +153,16 @@ class HistorySearchPlugin(Star):
     async def initialize(self) -> None:
         if self.store.closed:
             self.store = self._new_store()
+        if self.images.closing:
+            self.images = self._new_image_service()
+        await self.images.initialize()
         if self.enabled and self.cache_bot_responses and self._qq_send_observer is None:
             try:
                 from botpy.http import BotHttp
             except ImportError:
-                logger.info("[history-search] botpy unavailable; QQ send capture disabled")
+                logger.info(
+                    "[history-search] botpy unavailable; QQ send capture disabled"
+                )
             else:
                 self._qq_send_observer = QQSendObserver(
                     BotHttp, self._cache_qq_send, logger
@@ -158,6 +186,7 @@ class HistorySearchPlugin(Star):
             )
 
     async def terminate(self) -> None:
+        await self.images.terminate()
         if self._qq_send_observer:
             self._qq_send_observer.close()
             self._qq_send_observer = None
@@ -184,8 +213,9 @@ class HistorySearchPlugin(Star):
                 logger.exception("[history-search] scheduled cleanup failed")
 
     def _platform_allowed(self, event: AstrMessageEvent) -> bool:
-        if not self.enabled:
-            return False
+        return self.enabled and self._platform_listed(event)
+
+    def _platform_listed(self, event: AstrMessageEvent) -> bool:
         if not self.platform_allowlist:
             return True
         names = {
@@ -235,7 +265,9 @@ class HistorySearchPlugin(Star):
         content = self._trim_content(content)
         aliases = message_aliases(message_obj)
         astr_message_id = self._current_message_id(event)
-        original_message_id, ref_index, quoted_ref_index = message_identifiers(message_obj)
+        original_message_id, ref_index, quoted_ref_index = message_identifiers(
+            message_obj
+        )
         if not content and not (original_message_id or ref_index):
             return None
         aliases.extend(
@@ -331,6 +363,20 @@ class HistorySearchPlugin(Star):
                 record.scope_key,
                 len(record.content),
             )
+
+    def _quotes_bot(self, event: AstrMessageEvent) -> bool:
+        """Tell whether the event quotes the bot; AstrBot only shows a nickname.
+
+        QQ never sends a quote's author, only ``ref_msg_idx``. It matches the
+        ``ref_idx`` of the bot's send receipt cached by ``_cache_qq_send``.
+        """
+        _, _, quoted_ref = message_identifiers(event.message_obj)
+        quoted = (
+            self.store.find(self._scope_key(event), [quoted_ref])
+            if quoted_ref
+            else None
+        )
+        return bool(quoted and quoted.is_bot)
 
     @staticmethod
     def _uses_qq_receipts(event: AstrMessageEvent) -> bool:
@@ -580,6 +626,53 @@ class HistorySearchPlugin(Star):
             ensure_ascii=False,
         )
 
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    @filter.custom_filter(ImageCandidateFilter)
+    async def capture_images(self, event: AstrMessageEvent) -> None:
+        await self.images.capture(event)
+
+    @filter.on_llm_request()
+    async def add_image_index(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        await self.images.add_index(event, req)
+
+    @filter.llm_tool(name="image_cache_list")
+    async def image_cache_list(
+        self,
+        event: AstrMessageEvent,
+        limit: int = 10,
+        sender_id: str = "",
+        message_id: str = "",
+        before: str = "",
+    ) -> str:
+        """查询当前会话的缓存图片元数据，不会查看图片内容。结果按收录时间倒序，继续翻页时将末条图片编号传给 before。
+
+        Args:
+            limit(number): 返回条数，1 到 20，默认 10。
+            sender_id(string): 可选，按发送者 ID 筛选。
+            message_id(string): 可选，按原消息 ID 筛选。
+            before(string): 可选，上一页最后一条图片编号，用于查询更早图片。
+        """
+        return await self.images.list_images(
+            event, limit, sender_id, message_id, before
+        )
+
+    @filter.llm_tool(name="image_cache_view")
+    async def image_cache_view(self, event: AstrMessageEvent, image_ids: list[str]):
+        """按编号查看当前会话的缓存图片，每次最多 3 张。只在需要图片内容时调用，返回视觉预览；不会向聊天平台发送图片。动图仅预览首帧。
+
+        Args:
+            image_ids(array[string]): 从上下文图片索引或 image_cache_list 得到的图片编号列表，最多 3 个。
+        """
+        return await self.images.view_images(event, image_ids)
+
+    @filter.on_agent_done()
+    async def drop_image_previews(
+        self, event: AstrMessageEvent, run_context, resp
+    ) -> None:
+        await self.images.drop_previews(event, run_context)
+
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         return event.is_admin() or str(event.get_sender_id() or "") in self.admin_ids
 
@@ -622,5 +715,6 @@ class HistorySearchPlugin(Star):
             f"单群数量上限：{group_limit}\n"
             f"工具搜索范围：{'全局' if self.search_scope == 'global' else '分群'}\n"
             f"LLM 搜索：{'开启' if self.llm_search_enabled else '关闭'}\n"
+            f"图片缓存：{'开启' if self.images.enabled else '关闭'}\n"
             f"数据库：{total['db_path']}"
         )

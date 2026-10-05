@@ -47,39 +47,59 @@ class CodecTests(unittest.TestCase):
                 id="ROBOT1.0_current",
                 raw_data={
                     "id": "ROBOT1.0_current",
-                    "message_scene": {"ext": [
-                        "msg_idx=REFIDX_own==",
-                        "ref_msg_idx=REFIDX_target=",
-                        "auth_token=secret",
-                    ]},
+                    "message_scene": {
+                        "ext": [
+                            "msg_idx=REFIDX_own==",
+                            "ref_msg_idx=REFIDX_target=",
+                            "auth_token=secret",
+                        ]
+                    },
                     "msg_elements": [{"msg_idx": "REFIDX_nested"}],
                 },
             ),
         )
-        self.assertEqual(message_identifiers(message), (
-            "ROBOT1.0_current", "REFIDX_own==", "REFIDX_target=",
-        ))
+        self.assertEqual(
+            message_identifiers(message),
+            (
+                "ROBOT1.0_current",
+                "REFIDX_own==",
+                "REFIDX_target=",
+            ),
+        )
 
     def test_native_id_is_not_lost_when_astrbot_uses_same_id(self):
-        self.assertEqual(message_identifiers({
-            "message_id": "same", "raw_message": {"id": "same"},
-        }), ("same", "", ""))
+        self.assertEqual(
+            message_identifiers(
+                {
+                    "message_id": "same",
+                    "raw_message": {"id": "same"},
+                }
+            ),
+            ("same", "", ""),
+        )
 
     def test_missing_scene_does_not_use_quoted_message_identity(self):
-        self.assertEqual(message_identifiers({
-            "message_id": "current",
-            "raw_message": {
-                "message_reference": {"message_id": "target"},
-                "msg_elements": [{"msg_idx": "REFIDX_target"}],
-            },
-        }), ("current", "", ""))
+        self.assertEqual(
+            message_identifiers(
+                {
+                    "message_id": "current",
+                    "raw_message": {
+                        "message_reference": {"message_id": "target"},
+                        "msg_elements": [{"msg_idx": "REFIDX_target"}],
+                    },
+                }
+            ),
+            ("current", "", ""),
+        )
 
     def test_sent_outline_does_not_store_upload_or_auth_tokens(self):
-        content, components = sent_message_outline({
-            "markdown": {"content": "回复正文"},
-            "media": {"file_info": "secret-upload-token"},
-            "msg_id": "incoming-not-outgoing-id",
-        })
+        content, components = sent_message_outline(
+            {
+                "markdown": {"content": "回复正文"},
+                "media": {"file_info": "secret-upload-token"},
+                "msg_id": "incoming-not-outgoing-id",
+            }
+        )
         self.assertEqual(content, "回复正文 [富媒体]")
         self.assertNotIn("secret", repr(components))
 

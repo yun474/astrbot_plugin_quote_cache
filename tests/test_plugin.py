@@ -24,8 +24,16 @@ def load_plugin(data_dir):
         on_decorating_result=decorator,
         llm_tool=decorator,
         command=decorator,
+        custom_filter=decorator,
+        on_llm_request=decorator,
+        on_agent_done=decorator,
+        CustomFilter=object,
         EventMessageType=SimpleNamespace(ALL="all"),
     )
+    provider = ModuleType("astrbot.api.provider")
+    provider.ProviderRequest = object
+    agent_message = ModuleType("astrbot.core.agent.message")
+    agent_message.TextPart = SimpleNamespace
     stars = ModuleType("astrbot.api.star")
 
     class Star:
@@ -39,6 +47,8 @@ def load_plugin(data_dir):
         "astrbot.api": api,
         "astrbot.api.event": events,
         "astrbot.api.star": stars,
+        "astrbot.api.provider": provider,
+        "astrbot.core.agent.message": agent_message,
         "astrbot.core.utils.astrbot_path": paths,
     }
     spec = importlib.util.spec_from_file_location(
@@ -214,3 +224,51 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_identifier_only_message_is_cached(self):
         await self.plugin.capture_message(self.inbound_event(content=""))
         self.assertIsNotNone(self.plugin.store.find("bot|group:g1", ["REFIDX_own=="]))
+
+    def quoting_event(self):
+        return self.inbound_event()
+
+    async def test_qq_quote_of_bot_receipt_is_recognized(self):
+        event = self.quoting_event()
+        self.assertFalse(self.plugin._quotes_bot(event))
+        await self.send_receipt(idx="REFIDX_target==", private=True)
+        self.assertFalse(self.plugin._quotes_bot(event))  # other conversation
+        await self.send_receipt(idx="REFIDX_target==")
+        self.assertTrue(self.plugin._quotes_bot(event))
+
+    async def test_qq_quote_of_user_message_is_not_the_bot(self):
+        await self.plugin.capture_message(self.inbound_event())
+        event = self.quoting_event()
+        event.message_obj.raw_message.raw_data["message_scene"]["ext"] = [
+            "ref_msg_idx=REFIDX_own=="
+        ]
+        self.assertFalse(self.plugin._quotes_bot(event))
+
+    async def test_image_cache_follows_allowlist_not_history_switch(self):
+        event = self.inbound_event()
+        self.plugin.images.cache = object()
+        self.plugin.enabled = False
+        self.assertTrue(self.plugin.images.active(event))
+        self.plugin.platform_allowlist = {"telegram"}
+        self.assertFalse(self.plugin.images.active(event))
+        self.plugin.images.cache = None
+
+    def test_image_tool_docstrings_use_supported_types(self):
+        import docstring_parser
+
+        plugin_class = type(self.plugin)
+        view = docstring_parser.parse(plugin_class.image_cache_view.__doc__)
+        listing = docstring_parser.parse(plugin_class.image_cache_list.__doc__)
+        self.assertEqual(
+            [(p.arg_name, p.type_name) for p in view.params],
+            [("image_ids", "array[string]")],
+        )
+        self.assertEqual(
+            {p.arg_name for p in listing.params},
+            {"limit", "sender_id", "message_id", "before"},
+        )
+        # AstrBot only accepts these JSON schema names in tool docstrings.
+        supported = {"string", "number", "object", "array", "boolean"}
+        for param in view.params + listing.params:
+            outer, _, inner = param.type_name.rstrip("]").partition("[")
+            self.assertLessEqual({outer, inner or outer}, supported)

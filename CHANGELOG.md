@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.0
+
+消息缓存升级：除了正文，QQ 官方机器人收到的图片也能缓存、按需查看了。图片能力整合自 `astrbot_plugin_image_cache`。
+
+- 新增图片缓存（仅 QQ 官方机器人）：收录附件、引用和转发正文中的图片，提供 `image_cache_list`、`image_cache_view` 工具。每轮只附带图片元数据；当前消息已走原生识图时注明无需重复查看；模型不支持图片输入时直接报错；Agent 结束后从历史中移除预览图。
+- 用户引用机器人自己的消息时，用已缓存的发送回执按 `ref_msg_idx` 精确匹配，在图片索引中注明，并给引用里的图片标 `sender_is_bot`。
+- 图片缓存配置集中在 `image_cache` 对象，平台范围跟随 `platform_allowlist`，数据位于插件数据目录下的 `image_cache/`。`/历史消息状态` 会显示图片缓存开关。
+- 最低 AstrBot 版本提高到 4.23.2；运行依赖增加 `aiohttp`、`Pillow`、`mcp`（均由 AstrBot 自带）。
+- 装过 `astrbot_plugin_image_cache` 的请先卸载，避免工具重名；它的旧图片缓存不迁移。
+- 新增 `pyproject.toml` 与 pytest 配置，修正 Ruff 检查问题。
+
 ## v1.2.0
 
 - 增加引用消息索引缓存，可用于引用撤回等场景。
