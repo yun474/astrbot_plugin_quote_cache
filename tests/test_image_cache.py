@@ -21,14 +21,14 @@ class Event:
         message_id="m1",
         group_id="",
         self_id="bot",
-        quotes_bot=False,
+        quote=None,
     ):
         self.platform = platform
         self.platform_id = platform_id
         self.unified_msg_origin = scope
         self.group_id = group_id
         self.self_id = self_id
-        self.quotes_bot = quotes_bot
+        self.quote = quote
         self.message_obj = NS(
             message=list(chain),
             raw_message=NS(raw_data=raw or {}),
@@ -84,14 +84,14 @@ def scope_of(event):
 
 
 def make_service(module, root, settings=None):
-    # main.py decides whether a quote targets the bot; tests state it per event.
+    # main.py looks up the quoted message; tests state it per event.
     return module.ImageCacheService(
         Context(),
         settings or {},
         root,
         scope_of=scope_of,
         allowed=lambda event: True,
-        quotes_bot=lambda event: event.quotes_bot,
+        find_quote=lambda event: event.quote,
     )
 
 
@@ -111,14 +111,15 @@ async def test_capture_without_wakeup_and_repeated_view(
     event = Event([NS(type="Image", file=str(path))])
     await plugin.capture(event)
     state = event.get_extra(image_module.EVENT_KEY)
-    assert len(state["ids"]) == 1 and state["failed"] == 0
+    ids = [image["id"] for image in state["images"]]
+    assert len(ids) == 1 and state["failed"] == 0
     await plugin.capture(event)
     listed = json.loads(await plugin.list_images(event))
     assert len(listed["images"]) == 1
     # Original framework temporary file may disappear; plugin retains its own bytes.
     path.unlink()
     for _ in range(2):
-        result = await plugin.view_images(event, state["ids"])
+        result = await plugin.view_images(event, ids)
         assert not result.isError
         assert any(isinstance(item, ImageContent) for item in result.content)
 
@@ -142,7 +143,7 @@ async def test_qq_forward_url_to_cache_to_model(
         }
     )
     await plugin.capture(event)
-    image_id = event.get_extra(image_module.EVENT_KEY)["ids"][0]
+    image_id = event.get_extra(image_module.EVENT_KEY)["images"][0]["id"]
     result = await plugin.view_images(event, [image_id])
     assert seen == ["https://gchat.qpic.cn/a?sig=xyz"]
     assert json.loads(result.content[0].text)["message_id"] == "forward-child"
@@ -280,7 +281,7 @@ async def test_webhook_forward_is_cached(plugin, image_module, png_bytes, monkey
         platform="qq_official_webhook",
     )
     await plugin.capture(event)
-    assert len(event.get_extra(image_module.EVENT_KEY)["ids"]) == 1
+    assert len(event.get_extra(image_module.EVENT_KEY)["images"]) == 1
     assert image_module.has_image_candidate(event)
     assert not image_module.has_image_candidate(Event(platform="telegram"))
 
@@ -301,7 +302,7 @@ async def test_capture_fault_does_not_escape_to_pipeline(
     monkeypatch.setattr(image_module, "collect_images", malformed)
     event = Event()
     await plugin.capture(event)
-    assert event.get_extra(image_module.EVENT_KEY) == {"ids": [], "failed": 1}
+    assert event.get_extra(image_module.EVENT_KEY) == {"images": [], "failed": 1}
 
 
 async def test_busy_groups_have_bounded_pending_downloads(
@@ -423,9 +424,28 @@ async def test_request_waits_for_earlier_downloads(
     assert not asking.done()
     release.set()
     await asyncio.gather(capture, asking)
-    assert sent.get_extra(image_module.EVENT_KEY)["ids"][0] in (
+    assert sent.get_extra(image_module.EVENT_KEY)["images"][0]["id"] in (
         request.extra_user_content_parts[0].text
     )
+
+
+BOT_QUOTE = NS(
+    original_message_id="bot-msg",
+    sender_id="bot",
+    sender_name="云云",
+    timestamp=90,
+    is_bot=True,
+)
+
+
+def request_parts(request, module):
+    """Return the persistent message note and the transient index, if present."""
+    found = {}
+    for part in request.extra_user_content_parts:
+        for prefix in (module.MESSAGE_PREFIX, module.INDEX_PREFIX):
+            if part.text.startswith(prefix):
+                found[prefix] = json.loads(part.text.removeprefix(prefix))
+    return found.get(module.MESSAGE_PREFIX), found.get(module.INDEX_PREFIX)
 
 
 async def test_quoted_bot_images_are_attributed_to_the_bot(
@@ -433,29 +453,22 @@ async def test_quoted_bot_images_are_attributed_to_the_bot(
 ):
     path = tmp_path / "drawn.png"
     path.write_bytes(png_bytes)
-    reply = NS(
-        type="Reply",
-        id="bot-msg",
-        sender_id="bot",
-        sender_nickname="云云",
-        chain=[NS(type="Image", file=str(path))],
-    )
+    reply = NS(type="Reply", id="bot-msg", chain=[NS(type="Image", file=str(path))])
     event = Event(
         [reply, NS(type="Plain", text="这张图什么意思")],
         message_id="m2",
-        quotes_bot=True,
+        quote=BOT_QUOTE,
     )
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[str(path)])
     await plugin.add_index(event, request)
-    index = json.loads(
-        request.extra_user_content_parts[0].text.removeprefix(image_module.INDEX_PREFIX)
-    )
+    note, index = request_parts(request, image_module)
     assert "自己之前发的消息" in index["引用说明"]
-    (row,) = index["最近图片"]
-    assert row["sender_is_bot"] is True and row["origin"] == "引用"
+    (image,) = note["图片"]
+    assert image["sender_is_bot"] is True and image["origin"] == "引用"
+    assert image["附图序号"] == 1
     listed = json.loads(await plugin.list_images(event))["images"]
     assert listed[0]["sender_is_bot"] is True
-    viewed = await plugin.view_images(event, [row["id"]])
+    viewed = await plugin.view_images(event, [image["id"]])
     assert json.loads(viewed.content[0].text)["sender_is_bot"] is True
     # A user's own image keeps no bot flag, and quoting a user adds no note.
     user_reply = NS(type="Reply", id="u-msg", sender_id="u2", chain=[])
@@ -472,38 +485,134 @@ async def test_qq_official_quoted_bot_images_keep_stored_attribution(
 
     monkeypatch.setattr(image_module, "read_source", download)
 
-    def quote(ref):
+    def quote(url):
         return {
             "message_type": 103,
-            "message_scene": {"ext": ["msg_idx=REFIDX_new", f"ref_msg_idx={ref}"]},
             "msg_elements": [
-                {
-                    "attachments": [
-                        {"content_type": "image/png", "url": "gchat.qpic.cn/b"}
-                    ]
-                }
+                {"attachments": [{"content_type": "image/png", "url": url}]}
             ],
         }
 
     event = Event(
-        raw=quote("REFIDX_bot=="), self_id="qq_official", group_id="g1", quotes_bot=True
+        raw=quote("gchat.qpic.cn/b"),
+        self_id="qq_official",
+        group_id="g1",
+        quote=BOT_QUOTE,
     )
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
     await plugin.add_index(event, request)
-    index = json.loads(
-        request.extra_user_content_parts[0].text.removeprefix(image_module.INDEX_PREFIX)
-    )
+    note, index = request_parts(request, image_module)
     assert "自己之前发的消息" in index["引用说明"]
-    assert index["最近图片"][0]["sender_is_bot"] is True
+    (image,) = note["图片"]
+    assert image["sender_is_bot"] is True and "附图序号" not in image
+    assert "未随本条附带" in note["说明"]
     # The flag is stored, so it survives a different self_id on later events.
     later = Event(self_id="1234", group_id="g1", message_id="m9")
-    assert json.loads(await plugin.list_images(later))["images"][0]["sender_is_bot"]
+    listed = json.loads(await plugin.list_images(later))["images"][0]
+    assert listed["sender_is_bot"] and listed["message_id"] == "bot-msg"
 
-    other = Event(raw=quote("REFIDX_user=="), group_id="g2", message_id="m2")
+    other = Event(raw=quote("gchat.qpic.cn/c"), group_id="g2", message_id="m2")
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
     await plugin.add_index(other, request)
-    index = json.loads(
-        request.extra_user_content_parts[0].text.removeprefix(image_module.INDEX_PREFIX)
+    note, index = request_parts(request, image_module)
+    assert index is None
+    assert "sender_is_bot" not in note["图片"][0]
+
+
+async def test_quote_images_follow_request_order_and_quoted_author(
+    plugin, image_module, tmp_path
+):
+    # After PreProcess the chain holds local files, the QQ adapter puts the quote
+    # first, and the quoted raw element carries no ID.
+    paths = {}
+    for name, color in (("quoted", "blue"), ("own", "red")):
+        paths[name] = str(tmp_path / f"{name}.png")
+        Image.new("RGB", (8, 8), color).save(paths[name])
+    chain = [
+        NS(type="Reply", id="q1", chain=[NS(type="Image", file=paths["quoted"])]),
+        NS(type="Plain", text="这两张谁发的"),
+        NS(type="Image", file=paths["own"]),
+    ]
+    raw = {
+        "id": "m1",
+        "message_type": 103,
+        "attachments": [{"content_type": "image/png", "url": "gchat.qpic.cn/own"}],
+        "msg_elements": [
+            {"attachments": [{"content_type": "image/png", "url": "gchat.qpic.cn/q"}]}
+        ],
+    }
+    author = NS(
+        original_message_id="orig-q",
+        sender_id="u2",
+        sender_name="李四",
+        timestamp=50,
+        is_bot=False,
     )
-    assert "引用说明" not in index
-    assert "sender_is_bot" not in index["最近图片"][0]
+    event = Event(chain, raw, quote=author)
+    # AstrBot attaches the message's own images before quoted ones.
+    request = NS(
+        contexts=[],
+        extra_user_content_parts=[],
+        image_urls=[paths["own"], paths["quoted"]],
+    )
+    await plugin.add_index(event, request)
+    note, _ = request_parts(request, image_module)
+    own, quoted = note["图片"]
+    assert (own["附图序号"], own["origin"], own["sender_id"]) == (1, "当前消息", "u1")
+    assert (quoted["附图序号"], quoted["origin"], quoted["sender_id"]) == (
+        2,
+        "引用",
+        "u2",
+    )
+    listed = json.loads(await plugin.list_images(event, message_id="orig-q"))
+    assert [row["id"] for row in listed["images"]] == [quoted["id"]]
+
+    # One image AstrBot could not attach shifts the rest, so no position is given.
+    misaligned = NS(contexts=[], extra_user_content_parts=[], image_urls=[paths["own"]])
+    await plugin.add_index(event, misaligned)
+    note, _ = request_parts(misaligned, image_module)
+    assert "无法与编号逐一对齐" in note["说明"]
+    assert all("附图序号" not in image for image in note["图片"])
+
+
+async def test_recent_images_follow_arrival_not_download_speed(
+    plugin, image_module, monkeypatch
+):
+    release = asyncio.Event()
+
+    async def download(session, ref, **kwargs):
+        if ref.endswith("slow"):
+            await release.wait()
+        output = io.BytesIO()
+        Image.new("RGB", (8, 8), (len(ref), 0, 0)).save(output, format="PNG")
+        return output.getvalue()
+
+    monkeypatch.setattr(image_module, "read_source", download)
+    first = Event(
+        raw={"content": "https://gchat.qpic.cn/slow https://gchat.qpic.cn/b"},
+        message_id="m1",
+    )
+    capture = asyncio.create_task(plugin.capture(first))
+    while len(plugin.download_tasks) < 2:
+        await asyncio.sleep(0)
+    second = Event(raw={"content": "https://gchat.qpic.cn/c"}, message_id="m2")
+    await plugin.capture(second)
+    release.set()
+    await capture
+
+    def ids(event):
+        return [
+            image["id"] for image in event.get_extra(image_module.EVENT_KEY)["images"]
+        ]
+
+    page = json.loads(await plugin.list_images(second, limit=2))
+    rest = json.loads(await plugin.list_images(second, before=page["next_before"]))
+    assert [row["id"] for row in page["images"] + rest["images"]] == ids(second) + ids(
+        first
+    )
+    # The current message's images are listed once, not again as recent ones.
+    request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
+    await plugin.add_index(second, request)
+    note, index = request_parts(request, image_module)
+    assert [image["id"] for image in note["图片"]] == ids(second)
+    assert [row["id"] for row in index["最近图片"]] == ids(first)

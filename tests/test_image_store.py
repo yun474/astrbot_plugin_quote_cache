@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace as NS
@@ -268,3 +269,36 @@ def test_bot_attribution_is_stored_and_exposed_only_when_true(cache, png_bytes):
     assert flags == {user: None, bot: True}
     assert cache.preview("s", bot)[0]["sender_is_bot"] is True
     assert "sender_is_bot" not in cache.preview("s", user)[0]
+
+
+def test_listing_follows_arrival_and_position(cache, png_bytes):
+    now = time.time()
+    later = cache.store("s", replace(CANDIDATE, message_id="m2"), png_bytes, seen=now)
+    second = cache.store("s", CANDIDATE, png_bytes, seen=now - 1, position=1)
+    first = cache.store("s", replace(CANDIDATE, origin="引用"), png_bytes, seen=now - 1)
+    assert [row["id"] for row in cache.recent("s")] == [later, first, second]
+    assert [row["id"] for row in cache.recent("s", before=first)] == [second]
+
+
+def test_history_lookup_returns_only_own_images(cache, png_bytes):
+    own = cache.store("s", CANDIDATE, png_bytes)
+    cache.store("s", replace(CANDIDATE, origin="引用"), png_bytes)
+    assert cache.by_message("s", ["m1", "m2"]) == {"m1": [own]}
+    assert cache.by_message("other", ["m1"]) == {}
+
+
+def test_existing_index_gains_position_column(tmp_path, png_bytes):
+    import sqlite3
+
+    db = sqlite3.connect(tmp_path / "index.sqlite3")
+    db.execute("""CREATE TABLE sightings (
+        id TEXT PRIMARY KEY, scope TEXT NOT NULL, message_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
+        origin TEXT NOT NULL, sent_at REAL NOT NULL, created REAL NOT NULL,
+        digest TEXT NOT NULL, is_bot INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(scope, message_id, origin, digest))""")
+    db.close()
+    cache = ImageStore(tmp_path)
+    image_id = cache.store("s", CANDIDATE, png_bytes, position=2)
+    assert cache.recent("s")[0]["id"] == image_id
+    cache.close()

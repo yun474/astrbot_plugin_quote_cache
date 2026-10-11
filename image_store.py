@@ -177,15 +177,26 @@ class ImageStore:
                 sender_id TEXT NOT NULL, sender_name TEXT NOT NULL,
                 origin TEXT NOT NULL, sent_at REAL NOT NULL, created REAL NOT NULL,
                 digest TEXT NOT NULL, is_bot INTEGER NOT NULL DEFAULT 0,
+                position INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(scope, message_id, origin, digest)
             );
             CREATE INDEX IF NOT EXISTS by_scope ON sightings(scope, created DESC);
             CREATE INDEX IF NOT EXISTS by_digest ON sightings(digest);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(sightings)")}
+        if "position" not in columns:
+            with self.db:
+                self.db.execute(
+                    "ALTER TABLE sightings ADD COLUMN position INTEGER NOT NULL DEFAULT 0"
+                )
         self.prune()
 
-    def store(self, scope, candidate, data):
-        """Verify original bytes before admission, deduplication and eviction."""
+    def store(self, scope, candidate, data, *, seen=None, position=0):
+        """Verify original bytes before admission, deduplication and eviction.
+
+        ``seen`` is the message's arrival time and ``position`` the image's place
+        in it, so listings follow the chat rather than download completion.
+        """
         # Enforce our own lower limit without changing process-wide Pillow settings
         # or warning filters shared with AstrBot and other worker threads.
         with Image.open(io.BytesIO(data)) as img:
@@ -214,10 +225,13 @@ class ImageStore:
                 )
                 self.db.execute(
                     """INSERT INTO sightings (id, scope, message_id, sender_id, sender_name,
-                        origin, sent_at, created, digest, is_bot)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        origin, sent_at, created, digest, is_bot, position)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(scope, message_id, origin, digest)
-                    DO UPDATE SET created=excluded.created, is_bot=excluded.is_bot""",
+                    DO UPDATE SET sender_id=excluded.sender_id,
+                        sender_name=excluded.sender_name, sent_at=excluded.sent_at,
+                        created=excluded.created, is_bot=excluded.is_bot,
+                        position=excluded.position""",
                     (
                         "img_" + uuid.uuid4().hex[:16],
                         scope,
@@ -226,9 +240,10 @@ class ImageStore:
                         candidate.sender_name[:120],
                         candidate.origin,
                         candidate.timestamp or now,
-                        now,
+                        seen or now,
                         digest,
                         int(candidate.is_bot),
+                        position,
                     ),
                 )
             row = self.db.execute(
@@ -287,21 +302,38 @@ class ImageStore:
                     params.append(value)
             if before:
                 cursor = self.db.execute(
-                    "SELECT created FROM sightings WHERE scope=? AND id=?",
+                    "SELECT created, position FROM sightings WHERE scope=? AND id=?",
                     (scope, before),
                 ).fetchone()
                 if cursor is None:
                     return []
-                clauses.append("(created < ? OR (created = ? AND id < ?))")
-                params.extend([cursor[0], cursor[0], before])
+                # Newest message first; images within one message keep their order.
+                clauses.append("(created, -position, id) < (?, ?, ?)")
+                params.extend([cursor["created"], -cursor["position"], before])
             params.append(max(1, min(int(limit), 20)))
             rows = self.db.execute(
                 "SELECT id, message_id, sender_id, sender_name, origin, sent_at, is_bot FROM sightings WHERE "
                 + " AND ".join(clauses)
-                + " ORDER BY created DESC, id DESC LIMIT ?",
+                + " ORDER BY created DESC, position, id DESC LIMIT ?",
                 params,
             ).fetchall()
             return [public_row(row) for row in rows]
+
+    def by_message(self, scope, message_ids):
+        """Map message IDs to the images each message carried itself, in order."""
+        message_ids = list(message_ids)
+        with self.lock:
+            rows = self.db.execute(
+                f"""SELECT id, message_id FROM sightings
+                WHERE scope=? AND created>=? AND origin != ?
+                AND message_id IN ({",".join("?" * len(message_ids))})
+                ORDER BY created, position""",
+                (scope, time.time() - self.retention, "引用", *message_ids),
+            ).fetchall()
+        result = {}
+        for row in rows:
+            result.setdefault(row["message_id"], []).append(row["id"])
+        return result
 
     def preview(self, scope, image_id):
         """Load only a currently authorized sighting, returning a bounded preview."""

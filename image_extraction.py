@@ -90,17 +90,22 @@ def collect_images(
         limit: Maximum number of candidates to return.
 
     Returns:
-        Image candidates in message order, deduplicated by reference and origin.
+        Image candidates deduplicated by reference and origin. Chain images come
+        first, in AstrBot's request order: the message's own, then quoted ones.
     """
     found = []
     seen = set()
     visited = 0
-    represented = {message_id: sum(kind(c) == "image" for c in chain)}
-    for component in chain:
-        if kind(component) == "reply" and field(component, "id"):
-            represented[str(field(component, "id"))] = sum(
-                kind(c) == "image" for c in (field(component, "chain") or [])
-            )
+    replies = [c for c in chain if kind(c) == "reply"]
+    # QQ quote elements carry no ID; they belong to the quoted message instead.
+    quote_id = next((str(field(r, "id")) for r in replies if field(r, "id")), "")
+    # PreProcess localizes chain images, so raw URLs cannot match them by value.
+    represented = {
+        "当前消息": sum(kind(c) == "image" for c in chain),
+        "引用": sum(
+            kind(c) == "image" for r in replies for c in (field(r, "chain") or [])
+        ),
+    }
 
     def add(ref, mid, origin, sid, name, when, local=False):
         if not isinstance(ref, str) or not ref.strip() or len(found) >= limit:
@@ -190,7 +195,7 @@ def collect_images(
         ]
         # Localized components no longer carry the original URL. Match the known
         # attachment count, but retain unknown CDN attachments the adapter missed.
-        if represented.get(mid) and represented[mid] == len(recognized):
+        if represented.get(origin) and represented[origin] == len(recognized):
             attachments = [a for a in attachments if a not in recognized]
         for attachment in attachments:
             mime = str(
@@ -231,10 +236,19 @@ def collect_images(
                 child_sid, child_name = (
                     ("", "") if child_origin != origin else (sid, name)
                 )
-                walk(child, mid, child_origin, child_sid, child_name, when, depth + 1)
+                child_mid = (quote_id or mid) if child_origin == "引用" else mid
+                walk(
+                    child,
+                    child_mid,
+                    child_origin,
+                    child_sid,
+                    child_name,
+                    when,
+                    depth + 1,
+                )
 
     walk(
-        chain,
+        [c for c in chain if kind(c) != "reply"] + replies,
         message_id,
         "当前消息",
         sender_id,

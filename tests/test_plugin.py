@@ -1,10 +1,11 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from astrbot_plugin_quote_cache import __path__ as plugin_path
 
@@ -230,19 +231,42 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_qq_quote_of_bot_receipt_is_recognized(self):
         event = self.quoting_event()
-        self.assertFalse(self.plugin._quotes_bot(event))
+        self.assertIsNone(self.plugin._quoted_message(event))
         await self.send_receipt(idx="REFIDX_target==", private=True)
-        self.assertFalse(self.plugin._quotes_bot(event))  # other conversation
+        self.assertIsNone(self.plugin._quoted_message(event))  # other conversation
         await self.send_receipt(idx="REFIDX_target==")
-        self.assertTrue(self.plugin._quotes_bot(event))
+        self.assertTrue(self.plugin._quoted_message(event).is_bot)
 
-    async def test_qq_quote_of_user_message_is_not_the_bot(self):
+    async def test_qq_quote_of_user_message_names_its_author(self):
         await self.plugin.capture_message(self.inbound_event())
         event = self.quoting_event()
         event.message_obj.raw_message.raw_data["message_scene"]["ext"] = [
             "ref_msg_idx=REFIDX_own=="
         ]
-        self.assertFalse(self.plugin._quotes_bot(event))
+        quoted = self.plugin._quoted_message(event)
+        self.assertFalse(quoted.is_bot)
+        self.assertEqual(
+            (quoted.sender_id, quoted.original_message_id), ("user", "incoming")
+        )
+
+    async def test_history_results_name_cached_images(self):
+        await self.plugin.capture_message(self.inbound_event("看这张图"))
+        self.plugin.images.message_images = AsyncMock(
+            return_value={"incoming": ["img_1"]}
+        )
+        asking = self.inbound_event("刚才那张图")
+        asking.message_obj.message_id = "asking"
+        found = json.loads(await self.plugin.search_chat_history(asking, "这张图"))
+        self.assertEqual(found["results"][0]["images"], ["img_1"])
+        self.plugin.images.message_images.assert_awaited_with(
+            "bot|group:g1", {"incoming"}
+        )
+        context = json.loads(
+            await self.plugin.get_chat_history_context(
+                asking, found["results"][0]["record_id"]
+            )
+        )
+        self.assertEqual(context["messages"][0]["images"], ["img_1"])
 
     async def test_image_cache_follows_allowlist_not_history_switch(self):
         event = self.inbound_event()

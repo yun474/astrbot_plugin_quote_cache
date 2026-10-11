@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 from astrbot_plugin_quote_cache.image_extraction import collect_images, qq_image_url
@@ -150,3 +151,38 @@ def test_traversal_and_image_limits():
 
 def test_raw_payload_cannot_supply_local_paths():
     assert collect(raw={"type": "image", "data": {"file": "file:///etc/passwd"}}) == []
+
+
+def test_qq_quote_follows_request_order_without_duplicates(tmp_path):
+    # After PreProcess the chain holds local files, the QQ adapter puts the quote
+    # first, and the quoted raw element carries no ID of its own.
+    chain = [
+        NS(
+            type="Reply",
+            id="q1",
+            chain=[NS(type="Image", file=str(tmp_path / "q.png"))],
+        ),
+        NS(type="Plain", text="看"),
+        NS(type="Image", file=str(tmp_path / "c.png")),
+    ]
+    raw = {
+        "id": "m1",
+        "message_type": 103,
+        "attachments": [{"content_type": "image/png", "url": "gchat.qpic.cn/c"}],
+        "msg_elements": [
+            {
+                "content": "https://gchat.qpic.cn/text",
+                "attachments": [
+                    {"content_type": "image/png", "url": "gchat.qpic.cn/q"}
+                ],
+            }
+        ],
+    }
+    found = [(Path(i.ref).name, i.message_id, i.origin) for i in collect(chain, raw)]
+    assert found == [
+        ("c.png", "m1", "当前消息"),
+        ("q.png", "q1", "引用"),
+        ("text", "q1", "引用"),
+    ]
+    quote_only = collect(chain[:2], {**raw, "attachments": []})
+    assert [Path(i.ref).name for i in quote_only] == ["q.png", "text"]
