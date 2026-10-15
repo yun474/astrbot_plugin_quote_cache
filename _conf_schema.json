@@ -53,6 +53,17 @@
     "type": "bool",
     "default": true
   },
+  "group_context_limit": {
+    "description": "附带的群聊记录条数",
+    "type": "int",
+    "default": 20,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 1
+    },
+    "hint": "仅在 AstrBot 未开启群聊上下文感知时生效：每次请求附带上一轮对话之后的群聊消息，图片带缓存编号。开启群聊上下文感知时不额外注入，只在 AstrBot 的记录里补图片编号。设为 0 关闭。"
+  },
   "max_message_chars": {
     "description": "单条消息最多缓存的字符数",
     "type": "int",
@@ -133,17 +144,6 @@
           "max": 50,
           "step": 1
         }
-      },
-      "context_count": {
-        "description": "每轮提示的最近图片条数",
-        "type": "int",
-        "default": 5,
-        "slider": {
-          "min": 0,
-          "max": 20,
-          "step": 1
-        },
-        "hint": "只包含图片编号、消息来源和时间，不传图片。设为 0 可仅通过查询工具发现图片。"
       },
       "max_images_per_message": {
         "description": "每条消息最多缓存图片数",

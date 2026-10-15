@@ -65,6 +65,28 @@ def image_module(monkeypatch):
 
 
 @pytest.fixture
+def chat_module(monkeypatch):
+    """加载 chat_context.py，只替换框架的 TextPart。"""
+
+    @dataclass
+    class TextPart:
+        text: str
+        type: str = "text"
+
+    for name in ("astrbot", "astrbot.core", "astrbot.core.agent"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    models = types.ModuleType("astrbot.core.agent.message")
+    models.TextPart = TextPart
+    monkeypatch.setitem(sys.modules, models.__name__, models)
+    name = PACKAGE + ".chat_context"
+    spec = importlib.util.spec_from_file_location(name, ROOT / "chat_context.py")
+    loaded = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, loaded)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+@pytest.fixture
 def png_bytes():
     output = io.BytesIO()
     Image.new("RGB", (32, 24), "red").save(output, format="PNG")

@@ -2,7 +2,7 @@ name: astrbot_plugin_quote_cache
 display_name: 历史消息与图片缓存
 desc: 按群聊或私聊持久缓存 AstrBot 收到的消息与图片，让 LLM 主动搜索历史正文、读取上下文，并按需查看缓存图片。
 help: LLM 可调用 search_chat_history、image_cache_list、image_cache_view；管理员可用 /历史消息状态、/历史消息清理。
-version: v1.3.1
+version: v1.4.0
 author: 云云
 repo: "https://github.com/yun474/astrbot_plugin_quote_cache"
 astrbot_version: ">=4.23.2"

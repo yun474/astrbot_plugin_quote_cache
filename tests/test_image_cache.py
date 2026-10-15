@@ -200,13 +200,11 @@ async def test_request_only_adds_metadata_and_retains_current_images(
         image_urls=["current.png"],
         prompt="看看刚才那张",
     )
-    await plugin.add_index(event, request)
+    await plugin.prepare_request(event, request)
     assert request.image_urls == ["current.png"]
     assert request.prompt == "看看刚才那张"
-    assert all(part.type == "text" for part in request.extra_user_content_parts)
-    assert request.extra_user_content_parts[0].text.startswith(
-        image_module.INDEX_PREFIX
-    )
+    # 之前收录的图片不再作为“最近图片”附到不带图的新消息上
+    assert request.extra_user_content_parts == []
     assert "OWN" not in str(request.contexts) and "OTHER" in str(request.contexts)
     assert "OWN" in str(previous)  # No in-place mutation of shared history.
 
@@ -251,9 +249,10 @@ async def test_download_failure_is_visible_without_leaking_signed_url(
     monkeypatch.setattr(image_module, "read_source", failed)
     event = Event(raw={"content": "https://gchat.qpic.cn/a?secret=value"})
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    await plugin.add_index(event, request)
-    assert '"本条缓存失败数": 1' in request.extra_user_content_parts[0].text
-    assert "secret=value" not in caplog.text
+    await plugin.prepare_request(event, request)
+    (note,) = request.extra_user_content_parts
+    assert '"缓存失败数": 1' in note.text and "未能缓存" in note.text
+    assert "secret=value" not in caplog.text and "secret=value" not in note.text
 
 
 async def test_animated_preview_is_explicit(plugin, image_module):
@@ -370,11 +369,11 @@ async def test_native_images_are_not_viewed_again(
     path.write_bytes(png_bytes)
     event = Event([NS(type="Image", file=str(path))])
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[str(path)])
-    await plugin.add_index(event, request)
+    await plugin.prepare_request(event, request)
     assert "无需再用 image_cache_view" in request.extra_user_content_parts[0].text
     later = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    await plugin.add_index(Event(message_id="m2"), later)
-    assert "无需再用" not in later.extra_user_content_parts[0].text
+    await plugin.prepare_request(Event(message_id="m2"), later)
+    assert later.extra_user_content_parts == []
 
 
 async def test_view_refuses_text_only_model(plugin, png_bytes):
@@ -419,14 +418,17 @@ async def test_request_waits_for_earlier_downloads(
     while not plugin.download_tasks:
         await asyncio.sleep(0)
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    asking = asyncio.create_task(plugin.add_index(Event(message_id="m2"), request))
+    asking = asyncio.create_task(
+        plugin.prepare_request(Event(message_id="m2"), request)
+    )
     await asyncio.sleep(0)
     assert not asking.done()
     release.set()
     await asyncio.gather(capture, asking)
-    assert sent.get_extra(image_module.EVENT_KEY)["images"][0]["id"] in (
-        request.extra_user_content_parts[0].text
-    )
+    # 等待结束后再查询群聊记录，才能拿到刚收录图片的编号
+    (image,) = sent.get_extra(image_module.EVENT_KEY)["images"]
+    found = await plugin.message_images(plugin.scope_of(sent), ["m1"])
+    assert found == {"m1": [image["id"]]}
 
 
 BOT_QUOTE = NS(
@@ -439,13 +441,13 @@ BOT_QUOTE = NS(
 
 
 def request_parts(request, module):
-    """Return the persistent message note and the transient index, if present."""
-    found = {}
+    """Return the message note; the old recent-image index must never appear."""
+    note = None
     for part in request.extra_user_content_parts:
-        for prefix in (module.MESSAGE_PREFIX, module.INDEX_PREFIX):
-            if part.text.startswith(prefix):
-                found[prefix] = json.loads(part.text.removeprefix(prefix))
-    return found.get(module.MESSAGE_PREFIX), found.get(module.INDEX_PREFIX)
+        assert not part.text.startswith(module.INDEX_PREFIX)
+        if part.text.startswith(module.MESSAGE_PREFIX):
+            note = json.loads(part.text.removeprefix(module.MESSAGE_PREFIX))
+    return note
 
 
 async def test_quoted_bot_images_are_attributed_to_the_bot(
@@ -460,9 +462,9 @@ async def test_quoted_bot_images_are_attributed_to_the_bot(
         quote=BOT_QUOTE,
     )
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[str(path)])
-    await plugin.add_index(event, request)
-    note, index = request_parts(request, image_module)
-    assert "自己之前发的消息" in index["引用说明"]
+    await plugin.prepare_request(event, request)
+    note = request_parts(request, image_module)
+    assert "自己之前发的消息" in note["引用说明"]
     (image,) = note["图片"]
     assert image["sender_is_bot"] is True and image["origin"] == "引用"
     assert image["附图序号"] == 1
@@ -473,8 +475,8 @@ async def test_quoted_bot_images_are_attributed_to_the_bot(
     # A user's own image keeps no bot flag, and quoting a user adds no note.
     user_reply = NS(type="Reply", id="u-msg", sender_id="u2", chain=[])
     other = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    await plugin.add_index(Event([user_reply], message_id="m3"), other)
-    assert "引用说明" not in other.extra_user_content_parts[0].text
+    await plugin.prepare_request(Event([user_reply], message_id="m3"), other)
+    assert other.extra_user_content_parts == []
 
 
 async def test_qq_official_quoted_bot_images_keep_stored_attribution(
@@ -500,9 +502,9 @@ async def test_qq_official_quoted_bot_images_keep_stored_attribution(
         quote=BOT_QUOTE,
     )
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    await plugin.add_index(event, request)
-    note, index = request_parts(request, image_module)
-    assert "自己之前发的消息" in index["引用说明"]
+    await plugin.prepare_request(event, request)
+    note = request_parts(request, image_module)
+    assert "自己之前发的消息" in note["引用说明"]
     (image,) = note["图片"]
     assert image["sender_is_bot"] is True and "附图序号" not in image
     assert "未随本条附带" in note["说明"]
@@ -513,9 +515,9 @@ async def test_qq_official_quoted_bot_images_keep_stored_attribution(
 
     other = Event(raw=quote("gchat.qpic.cn/c"), group_id="g2", message_id="m2")
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    await plugin.add_index(other, request)
-    note, index = request_parts(request, image_module)
-    assert index is None
+    await plugin.prepare_request(other, request)
+    note = request_parts(request, image_module)
+    assert "引用说明" not in note
     assert "sender_is_bot" not in note["图片"][0]
 
 
@@ -555,8 +557,8 @@ async def test_quote_images_follow_request_order_and_quoted_author(
         extra_user_content_parts=[],
         image_urls=[paths["own"], paths["quoted"]],
     )
-    await plugin.add_index(event, request)
-    note, _ = request_parts(request, image_module)
+    await plugin.prepare_request(event, request)
+    note = request_parts(request, image_module)
     own, quoted = note["图片"]
     assert (own["附图序号"], own["origin"], own["sender_id"]) == (1, "当前消息", "u1")
     assert (quoted["附图序号"], quoted["origin"], quoted["sender_id"]) == (
@@ -569,8 +571,8 @@ async def test_quote_images_follow_request_order_and_quoted_author(
 
     # One image AstrBot could not attach shifts the rest, so no position is given.
     misaligned = NS(contexts=[], extra_user_content_parts=[], image_urls=[paths["own"]])
-    await plugin.add_index(event, misaligned)
-    note, _ = request_parts(misaligned, image_module)
+    await plugin.prepare_request(event, misaligned)
+    note = request_parts(misaligned, image_module)
     assert "无法与编号逐一对齐" in note["说明"]
     assert all("附图序号" not in image for image in note["图片"])
 
@@ -610,9 +612,9 @@ async def test_recent_images_follow_arrival_not_download_speed(
     assert [row["id"] for row in page["images"] + rest["images"]] == ids(second) + ids(
         first
     )
-    # The current message's images are listed once, not again as recent ones.
+    # 本条只说明自己的图片，较早消息的图片不再附带
     request = NS(contexts=[], extra_user_content_parts=[], image_urls=[])
-    await plugin.add_index(second, request)
-    note, index = request_parts(request, image_module)
+    await plugin.prepare_request(second, request)
+    note = request_parts(request, image_module)
     assert [image["id"] for image in note["图片"]] == ids(second)
-    assert [row["id"] for row in index["最近图片"]] == ids(first)
+    assert not any(i in request.extra_user_content_parts[0].text for i in ids(first))

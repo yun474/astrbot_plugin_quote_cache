@@ -155,6 +155,10 @@ class MessageStore:
             );
             CREATE INDEX IF NOT EXISTS idx_alias_lookup
                 ON aliases(scope_key, alias);
+            CREATE TABLE IF NOT EXISTS request_marks (
+                scope_key TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL
+            );
             """
         )
         columns = {
@@ -480,6 +484,49 @@ class MessageStore:
             ).fetchall()
         rows = list(reversed(older)) + [anchor] + list(newer)
         return [self._row_to_message(row) for row in rows]
+
+    def request_mark(self, scope_key: str) -> int | None:
+        """上一次 LLM 请求时该会话最后一条消息的 ID；没有记录时取机器人最近一次发言。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT message_id FROM request_marks WHERE scope_key=?", (scope_key,)
+            ).fetchone()
+            if row is None:
+                row = self._db.execute(
+                    "SELECT MAX(id) AS message_id FROM messages "
+                    "WHERE scope_key=? AND is_bot=1",
+                    (scope_key,),
+                ).fetchone()
+        return None if row is None or row["message_id"] is None else int(row[0])
+
+    def set_request_mark(self, scope_key: str, message_id: int) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO request_marks(scope_key, message_id) VALUES(?, ?) "
+                "ON CONFLICT(scope_key) DO UPDATE SET "
+                "message_id=MAX(message_id, excluded.message_id)",
+                (scope_key, int(message_id)),
+            )
+            self._db.commit()
+
+    def messages_between(
+        self, scope_key: str, after_id: int, before_id: int, limit: int
+    ) -> tuple[list[CachedMessage], int]:
+        """返回两条消息之间别人发的消息（最近 limit 条，按时间正序）及未列出的条数。"""
+        clauses = "scope_key=? AND id>? AND id<? AND is_bot=0 AND expires_at>?"
+        params = (scope_key, int(after_id), int(before_id), int(time.time()))
+        with self._lock:
+            total = int(
+                self._db.execute(
+                    f"SELECT COUNT(*) FROM messages WHERE {clauses}", params
+                ).fetchone()[0]
+            )
+            rows = self._db.execute(
+                f"SELECT * FROM messages WHERE {clauses} ORDER BY id DESC LIMIT ?",
+                (*params, max(1, int(limit))),
+            ).fetchall()
+        messages = [self._row_to_message(row) for row in reversed(rows)]
+        return messages, total - len(messages)
 
     def cleanup_expired(self) -> tuple[int, list[str]]:
         now = int(time.time())

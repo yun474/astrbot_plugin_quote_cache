@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -176,39 +177,196 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.plugin.store.find("bot|private:g1", ["sent"]).content, "reset"
         )
 
-    def inbound_event(self, content="正文"):
+    def inbound_event(
+        self,
+        content="正文",
+        *,
+        message_id="incoming",
+        sender=("user", "用户"),
+        components=None,
+        own_idx="REFIDX_own==",
+        quoted_idx="REFIDX_target==",
+    ):
         message = SimpleNamespace(
-            message_id="incoming",
+            message_id=message_id,
             self_id="bot",
             timestamp=None,
-            message=[{"type": "plain", "text": content}],
+            message=components or [{"type": "plain", "text": content}],
             raw_message=SimpleNamespace(
-                id="incoming",
+                id=message_id,
                 group_openid="g1",
                 raw_data={
-                    "id": "incoming",
+                    "id": message_id,
                     "message_scene": {
                         "ext": [
-                            "msg_idx=REFIDX_own==",
-                            "ref_msg_idx=REFIDX_target==",
+                            f"msg_idx={own_idx}",
+                            f"ref_msg_idx={quoted_idx}",
                             "auth_token=secret",
                         ]
                     },
                 },
             ),
         )
+        extras = {}
         return SimpleNamespace(
             message_obj=message,
+            unified_msg_origin="qq_official:GroupMessage:g1",
+            get_extra=extras.get,
+            set_extra=extras.__setitem__,
             get_message_str=lambda: content,
             get_platform_name=lambda: "qq_official",
             get_platform_id=lambda: "bot",
             get_group_id=lambda: "g1",
             get_session_id=lambda: "g1",
-            get_sender_id=lambda: "user",
-            get_sender_name=lambda: "用户",
+            get_sender_id=lambda: sender[0],
+            get_sender_name=lambda: sender[1],
             get_message_type=lambda: "GroupMessage",
             get_result=Mock(),
         )
+
+    def group_context(self, enabled, recorder=None):
+        """模拟 AstrBot 的配置与内置群聊上下文记录。"""
+        self.context.get_config = lambda umo=None: {
+            "provider_ltm_settings": {"group_icl_enable": enabled}
+        }
+        self.context.get_registered_star = lambda name: SimpleNamespace(
+            star_cls=SimpleNamespace(group_chat_context=recorder)
+        )
+
+    @staticmethod
+    def request(*texts):
+        return SimpleNamespace(
+            contexts=[],
+            image_urls=[],
+            extra_user_content_parts=[SimpleNamespace(text=t) for t in texts],
+        )
+
+    async def test_group_context_lines_get_image_ids_without_new_records(self):
+        line = "[张三/14:02:31]:  这题第二问咋做 [Image]"
+        recorder = SimpleNamespace(
+            raw_records={"qq_official:GroupMessage:g1": deque([line])},
+            _record_ids={"qq_official:GroupMessage:g1": deque(["r1"])},
+        )
+        self.group_context(True, recorder)
+        sent = self.inbound_event("这题第二问咋做", message_id="m1")
+        sent.set_extra("_group_context_record_id", "r1")
+        sent.set_extra(
+            "image_cache.capture",
+            {"slots": {"own": ["img_a"], "quote": [], "other": []}},
+        )
+        await self.plugin.capture_message(sent)
+        await self.plugin.remember_group_record(sent)
+
+        asking = self.inbound_event("在不在", message_id="m2")
+        await self.plugin.capture_message(asking)
+        injected = f"<system_reminder>...\n{line}\n--- END CONTEXT ---"
+        req = self.request(injected)
+        await self.plugin.decorate_request(asking, req)
+        texts = [part.text for part in req.extra_user_content_parts]
+        self.assertEqual(texts[0], injected.replace("[Image]", "[Image img_a]"))
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(texts[1].startswith("[图片编号说明]"))
+        self.assertFalse(any(t.startswith("[群聊记录]") for t in texts))
+
+    async def test_own_transcript_covers_messages_since_last_request(self):
+        self.group_context(False)
+        self.plugin.images.message_images = AsyncMock(return_value={"m1": ["img_a"]})
+        await self.send_receipt()  # 上一轮机器人的回复是首次请求的起点
+        await self.plugin.capture_message(
+            self.inbound_event(
+                message_id="m1",
+                sender=("u1", "张三"),
+                components=[{"type": "plain", "text": "看这题"}, {"type": "image"}],
+                own_idx="REFIDX_m1",
+                quoted_idx="",
+            )
+        )
+        await self.plugin.capture_message(
+            self.inbound_event(
+                message_id="m2",
+                sender=("u2", "李四"),
+                components=[{"type": "reply"}, {"type": "plain", "text": "我也不会"}],
+                own_idx="REFIDX_m2",
+                quoted_idx="REFIDX_m1",
+            )
+        )
+        asking = self.inbound_event("在不在", message_id="m3", own_idx="REFIDX_m3")
+        await self.plugin.capture_message(asking)
+        req = self.request()
+        await self.plugin.decorate_request(asking, req)
+        (part,) = req.extra_user_content_parts
+        lines = part.text.splitlines()
+        self.assertEqual(lines[0], "[群聊记录]")
+        self.assertTrue(lines[2].endswith("张三：看这题 [图片 img_a]"))
+        self.assertIn("李四：[引用 张三 ", lines[3])
+        self.assertIn("「看这题 [图片 img_a]」] 我也不会", lines[3])
+        self.assertEqual(len(lines), 4)  # 不含机器人回复和当前这条
+
+        # 下一轮只带这一轮之后的消息，超出上限时说明还有未列出的
+        self.plugin.group_context_limit = 1
+        for index, name in enumerate(("王五", "赵六")):
+            await self.plugin.capture_message(
+                self.inbound_event(
+                    f"第{index}句",
+                    message_id=f"n{index}",
+                    sender=(name, name),
+                    own_idx=f"REFIDX_n{index}",
+                )
+            )
+        again = self.inbound_event("还在吗", message_id="m4", own_idx="REFIDX_m4")
+        await self.plugin.capture_message(again)
+        req = self.request()
+        await self.plugin.decorate_request(again, req)
+        text = req.extra_user_content_parts[0].text
+        self.assertIn("更早还有 1 条未列出", text)
+        self.assertIn("赵六：第1句", text)
+        self.assertNotIn("张三", text)
+        self.assertNotIn("王五", text)
+
+    async def test_transcript_needs_a_known_starting_point(self):
+        self.group_context(False)
+        await self.plugin.capture_message(
+            self.inbound_event("很久以前", message_id="old")
+        )
+        asking = self.inbound_event("在不在", message_id="m2", own_idx="REFIDX_m2")
+        await self.plugin.capture_message(asking)
+        req = self.request()
+        await self.plugin.decorate_request(asking, req)
+        self.assertEqual(req.extra_user_content_parts, [])
+        # 本次请求成为下一轮的起点
+        await self.plugin.capture_message(
+            self.inbound_event("新消息", message_id="m3", own_idx="REFIDX_m3")
+        )
+        later = self.inbound_event("还在吗", message_id="m4", own_idx="REFIDX_m4")
+        await self.plugin.capture_message(later)
+        req = self.request()
+        await self.plugin.decorate_request(later, req)
+        text = req.extra_user_content_parts[0].text
+        self.assertIn("新消息", text)
+        self.assertNotIn("很久以前", text)
+
+    async def test_history_tools_follow_allowlist_and_default_limit(self):
+        for index in range(3):
+            await self.plugin.capture_message(
+                self.inbound_event(
+                    f"图片缓存 {index}",
+                    message_id=f"s{index}",
+                    own_idx=f"REFIDX_s{index}",
+                )
+            )
+        asking = self.inbound_event("找一下", message_id="ask", own_idx="REFIDX_ask")
+        self.plugin.default_result_limit = 2
+        found = json.loads(await self.plugin.search_chat_history(asking, "图片缓存"))
+        self.assertEqual(found["count"], 2)
+        self.plugin.platform_allowlist = {"telegram"}
+        blocked = json.loads(await self.plugin.search_chat_history(asking, "图片缓存"))
+        self.assertFalse(blocked["ok"])
+        context = json.loads(
+            await self.plugin.get_chat_history_context(
+                asking, found["results"][0]["record_id"]
+            )
+        )
+        self.assertFalse(context["ok"])
 
     async def test_inbound_stores_own_indices_and_never_aliases_quoted_target(self):
         event = self.inbound_event()
